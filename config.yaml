@@ -1,0 +1,157 @@
+# CEX-DEX arbitrage spread monitor configuration.
+#
+# MONITORING ONLY. Nothing in this file or this program executes trades:
+# RPC URLs are used for read-only eth_call quoting, and CEX endpoints are
+# public market-data endpoints. No API keys, no private keys, no wallets.
+#
+# Values like ${SOME_ENV} are expanded from the environment at load time.
+
+poll_interval: 15s        # spread sampling cadence per pair
+tvl_refresh_interval: 10m # how often pool TVL is re-estimated
+summary_interval: 60s     # console summary cadence
+max_book_age: 10s         # reject CEX top-of-book older than this
+data_dir: data            # JSONL sample output directory
+
+# Read-only JSON-RPC endpoints per chain. The public defaults below work for
+# light polling; replace with your own provider for reliability, e.g.:
+#   ethereum: "${ETH_RPC_URL}"
+chains:
+  ethereum: "https://ethereum-rpc.publicnode.com"
+  polygon: "https://polygon-rpc.com"
+  avalanche: "https://api.avax.network/ext/bc/C/rpc"
+  optimism: "https://mainnet.optimism.io"
+
+# Break-even model for ONE arbitrage round (one CEX taker fill + one DEX
+# swap), assuming inventory is already positioned on both venues.
+# DEX pool fees and price impact are NOT configured here — they are already
+# embedded in the size-aware exact-in quotes.
+costs:
+  cex_taker_fee_bps: 10.0 # Binance/KuCoin spot taker, no discounts
+  extra_buffer_bps: 5.0   # slippage-between-quote-and-fill / adverse-selection buffer
+  gas_usd: # rough per-swap gas cost; tune to current gas prices
+    ethereum: 4.00
+    polygon: 0.02
+    avalanche: 0.10
+    optimism: 0.05
+    solana: 0.02
+
+pairs:
+  # ---------------- Tier 1: deep liquidity (baseline) ----------------
+
+  - symbol: AVAX/USDT
+    tier: large
+    cex: { venue: binance }
+    dex:
+      chain: avalanche
+      venue: lfj
+      # LFJ (Trader Joe) Liquidity Book AVAX/USDT pair on the C-Chain.
+      # Find the current LBPair address at https://lfj.gg (pool page → contract).
+      pool_address: "REPLACE_ME_LB_PAIR_ADDRESS"
+      base_token: { address: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7" }  # WAVAX
+      quote_token: { address: "0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7" } # USDt
+    trade_sizes_usd: [1000, 5000, 20000]
+    min_pool_tvl_usd: 200000
+
+  - symbol: SOL/USDT
+    tier: large
+    cex: { venue: binance }
+    dex:
+      chain: solana
+      venue: jupiter # aggregate quote across Raydium/Orca/etc.
+      base_mint: "So11111111111111111111111111111111111111112"   # wSOL
+      quote_mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"  # USDT
+      base_token: { decimals: 9 }
+      quote_token: { decimals: 6 }
+      # quote_url: "https://lite-api.jup.ag/swap/v1/quote"  # default; needs no key
+    trade_sizes_usd: [1000, 5000, 20000]
+    min_pool_tvl_usd: 0 # aggregator quote — no single pool to gate on
+
+  - symbol: POL/USDT
+    tier: large
+    cex: { venue: binance, symbol: POLUSDT }
+    dex:
+      chain: polygon
+      venue: uniswap_v3
+      fee_tier: 500 # WPOL/USDT 0.05%; verify at https://app.uniswap.org/explore/pools/polygon
+      # pool_address enables the TVL gate; quoting works without it.
+      pool_address: ""
+      base_token: { address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" }  # WPOL (ex-WMATIC)
+      quote_token: { address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F" } # USDT (PoS)
+    trade_sizes_usd: [1000, 5000, 20000]
+    min_pool_tvl_usd: 200000
+
+  # ------------- Tier 2: small caps, thin liquidity -------------
+  # Smaller trade sizes: these pools are shallow and large sizes would only
+  # measure price impact, not arbitrage. min_pool_tvl_usd keeps samples taken
+  # during drained-pool periods out of the profitability stats.
+
+  - symbol: FLUX/USDT
+    tier: small
+    cex: { venue: binance } # listing is confirmed against exchangeInfo at startup
+    dex:
+      chain: ethereum
+      venue: uniswap_v3
+      # Verify the canonical FLUX ERC-20 address and its deepest pool/fee tier
+      # before enabling (FLUX is natively its own chain; only a bridged ERC-20
+      # trades on Uniswap). https://app.uniswap.org/explore/tokens/ethereum
+      pool_address: ""
+      fee_tier: 3000
+      route: # USDT -> WETH (0.05%) -> FLUX (fee_tier above)
+        - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", fee_tier: 500 }
+      base_token: { address: "REPLACE_ME_FLUX_ERC20_ADDRESS" }
+      quote_token: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" } # USDT
+    trade_sizes_usd: [100, 500, 1000]
+    min_pool_tvl_usd: 200000
+    enabled: false # enable after filling in the FLUX ERC-20 address
+
+  - symbol: ACX/USDT
+    tier: small
+    cex: { venue: binance }
+    dex:
+      chain: ethereum
+      venue: uniswap_v3
+      # ACX's main Uniswap liquidity is vs WETH, so route via WETH.
+      # Verify the final-leg fee tier (0.3% vs 1%) on the Uniswap explorer.
+      pool_address: ""
+      fee_tier: 3000
+      route: # USDT -> WETH (0.05%) -> ACX (fee_tier above)
+        - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", fee_tier: 500 }
+      base_token: { address: "0x44108f0223A3C3028F5Fe7AEC7f9bb2E66beF82F" }  # ACX
+      quote_token: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" } # USDT
+    trade_sizes_usd: [100, 500, 1000]
+    min_pool_tvl_usd: 200000
+
+  - symbol: VELO/USDT
+    tier: small
+    # !!! TICKER COLLISION — DO NOT ENABLE WITHOUT RESOLVING !!!
+    # The "VELO" listed on Binance and KuCoin is Velo Labs (velo.org), a
+    # DIFFERENT asset from Velodrome Finance's VELO on Optimism. Comparing
+    # them would produce meaningless "spreads" between two unrelated tokens.
+    # Only enable this pair if you find a CEX that actually lists Velodrome's
+    # VELO, and point `cex` at that venue.
+    enabled: false
+    cex: { venue: kucoin, symbol: VELO-USDT }
+    dex:
+      chain: optimism
+      venue: velodrome # vAMM v2 pools only (Slipstream CL pools unsupported)
+      pool_address: "REPLACE_ME_VELODROME_VAMM_POOL"
+      base_token: { address: "0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db" }  # VELO v2 (Velodrome)
+      quote_token: { address: "0x7F5c764cBc14f9669B88837ca1490cCa17c31607" } # USDC.e
+    trade_sizes_usd: [100, 500, 1000]
+    min_pool_tvl_usd: 200000
+
+  - symbol: GLM/USDT
+    tier: small
+    cex: { venue: binance }
+    dex:
+      chain: ethereum
+      venue: uniswap_v3
+      # GLM's main Uniswap liquidity is vs WETH, so route via WETH.
+      pool_address: ""
+      fee_tier: 3000
+      route: # USDT -> WETH (0.05%) -> GLM (fee_tier above)
+        - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", fee_tier: 500 }
+      base_token: { address: "0x7DD9c5Cba05E151C895FDe1CF355C9A1D5DA6429" }  # GLM
+      quote_token: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" } # USDT
+    trade_sizes_usd: [100, 500, 1000]
+    min_pool_tvl_usd: 200000
