@@ -6,11 +6,33 @@
 #
 # Values like ${SOME_ENV} are expanded from the environment at load time.
 
-poll_interval: 15s        # spread sampling cadence per pair
+poll_interval: 2s         # spread sampling cadence per pair (per-pair override below)
 tvl_refresh_interval: 10m # how often pool TVL is re-estimated
 summary_interval: 60s     # console summary cadence
 max_book_age: 10s         # reject CEX top-of-book older than this
-data_dir: data            # JSONL sample output directory
+max_leg_skew: 3s          # samples with |dex_ts - cex_ts| above this are
+                          # recorded but excluded from profitability stats
+# Momentum bucket threshold (bps of 10s CEX-mid move) separating "flat" from
+# strong up/down, for the latency-skew diagnostic. Per-pair overrides below
+# scale with each pair's volatility so the flat bucket keeps most samples:
+# large caps ~10, POL ~15, small caps 30-40 (their 10s noise alone spans
+# tens of bps; a 10 bps threshold would classify noise as "strong" moves).
+momentum_threshold_bps: 10
+data_dir: data            # parent for the DB, archives, legacy JSONL
+# db_path: data/monitor.db  # SQLite sample store
+# retention: 720h           # archive samples older than this (30d default)
+# archive_dir: data/archive # compressed JSONL archives from retention runs
+
+# Outbound request caps per endpoint, requests/second. One shared limiter per
+# endpoint paces ALL pairs using it (quotes + TVL), so a burst of pairs can't
+# blow through a free-tier RPC limit. See README "RPC request budget" for the
+# per-endpoint request math for this config.
+rate_limit_rps:
+  ethereum: 10
+  polygon: 10
+  avalanche: 10
+  optimism: 10
+  solana: 1 # Jupiter lite-api free tier is roughly 1 req/s
 
 # Read-only JSON-RPC endpoints per chain. The public defaults below work for
 # light polling; replace with your own provider for reliability, e.g.:
@@ -44,14 +66,18 @@ pairs:
     dex:
       chain: avalanche
       venue: lfj
-      # LFJ's deep AVAX stable pool is WAVAX/USDC (LB v2.2, ~$4.5M):
-      # the native WAVAX/USDt LB pair only holds ~$100k, so we quote the DEX
-      # side in USDC and treat USDC == USDT == $1 (documented model
-      # assumption). Thin native-USDt alternative:
+      # LFJ's deep AVAX stable pool is WAVAX/USDC (LB v2.2, ~$4.5M): the
+      # native WAVAX/USDt LB pair only holds ~$100k, so we quote the DEX
+      # side in USDC and convert to USDT via quote_basis_symbol below.
+      # Thin native-USDt alternative:
       #   0x87eb2f90d7d0034571f343fb7429ae22c1bd9f72 (quote 0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7, USDt)
       pool_address: "0x864d4e5ee7318e97483db7eb0912e09f161516ea"
       base_token: { address: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7" }  # WAVAX
       quote_token: { address: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E" } # USDC (native)
+      # The pool is USDC-quoted while the CEX pair is USDT-quoted: convert
+      # per sample using the live Binance USDCUSDT mid instead of assuming
+      # USDC == USDT. Samples store raw AND corrected edges (*_adj_bps).
+      quote_basis_symbol: USDCUSDT
     trade_sizes_usd: [1000, 5000, 20000]
     min_pool_tvl_usd: 200000
 
@@ -68,6 +94,9 @@ pairs:
       # quote_url: "https://lite-api.jup.ag/swap/v1/quote"  # default; needs no key
     trade_sizes_usd: [1000, 5000, 20000]
     min_pool_tvl_usd: 0 # aggregator quote — no single pool to gate on
+    # 6 quotes per sample against a ~1 req/s free tier: sample slower than
+    # the EVM pairs. Drop this override if you have a paid Jupiter API key.
+    poll_interval: 10s
 
   - symbol: POL/USDT
     tier: large
@@ -81,6 +110,7 @@ pairs:
       quote_token: { address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F" } # USDT (PoS)
     trade_sizes_usd: [1000, 5000, 20000]
     min_pool_tvl_usd: 200000
+    momentum_threshold_bps: 15
 
   # ------------- Tier 2: small caps, thin liquidity -------------
   # Smaller trade sizes: these pools are shallow and large sizes would only
@@ -92,20 +122,22 @@ pairs:
     cex: { venue: binance } # listing is confirmed against exchangeInfo at startup
     dex:
       chain: ethereum
-      venue: uniswap_v3
-      # FLUX/WETH 1% pool. VERY thin (~$55k, a handful of trades/day): the
-      # TVL gate will exclude these samples from profitability stats, which
-      # is exactly what tier-2 monitoring is for. For routed pairs the TVL
-      # estimate only counts the base-token side of this pool (its USDT
-      # balance is ~0), so it understates roughly 2x.
-      pool_address: "0x07aa6584385cca15c2c6e13a5599ffc2d177e33b"
-      fee_tier: 10000
-      route: # USDT -> WETH (0.05%) -> FLUX (1%)
-        - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", fee_tier: 500 }
+      venue: uniswap_v2
+      # FLUX's DEX liquidity is mostly the Uniswap v2 FLUX/WETH pair. The
+      # pair address is DERIVED from the v2 factory at startup (and any
+      # configured address is verified against it — a pasted fake/honeypot
+      # pool fails loudly). Routed-pair TVL prices only the FLUX side of the
+      # pair (~2x understated), same caveat as routed v3 pools.
+      pool_address: "" # factory-derived
+      route: # USDT -> WETH -> FLUX (0.3% v2 fee per hop)
+        - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" } # WETH
       base_token: { address: "0x720cd16b011b987da3518fbf38c3071d4f0d1495" } # FLUX (bridged ERC-20)
       quote_token: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" } # USDT
+      # v3 alternative (thin, ~$55k): venue uniswap_v3, fee_tier 10000,
+      # pool 0x07aa6584385cca15c2c6e13a5599ffc2d177e33b, WETH hop fee 500.
     trade_sizes_usd: [100, 500, 1000]
     min_pool_tvl_usd: 200000
+    momentum_threshold_bps: 40
 
   - symbol: ACX/USDT
     tier: small
@@ -123,6 +155,7 @@ pairs:
       quote_token: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" } # USDT
     trade_sizes_usd: [100, 500, 1000]
     min_pool_tvl_usd: 200000
+    momentum_threshold_bps: 30
 
   - symbol: VELO/USDT
     tier: small
@@ -139,26 +172,32 @@ pairs:
       venue: velodrome # vAMM v2 pools only (Slipstream CL pools unsupported)
       # VELO/USDC.e v2 pool (~$90k — thin even if the ticker issue is resolved)
       pool_address: "0x8134a2fdc127549480865fb8e5a9e8a8a95a54c5"
+      # Pool is USDC.e-quoted vs a USDT CEX pair: correct via KuCoin's
+      # USDC-USDT book (same pattern as AVAX's USDCUSDT on Binance).
+      quote_basis_symbol: USDC-USDT
       base_token: { address: "0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db" }  # VELO v2 (Velodrome)
       quote_token: { address: "0x7F5c764cBc14f9669B88837ca1490cCa17c31607" } # USDC.e
     trade_sizes_usd: [100, 500, 1000]
     min_pool_tvl_usd: 200000
+    momentum_threshold_bps: 40
 
   - symbol: GLM/USDT
     tier: small
     cex: { venue: binance }
     dex:
       chain: ethereum
-      venue: uniswap_v3
-      # GLM/WETH 1% v3 pool — thin (~$55k): most GLM DEX liquidity sits in
-      # the Uniswap v2 GLM/WETH pool, and v2 is not a supported venue here,
-      # so expect the TVL gate to exclude these samples (routed-pair TVL
-      # counts only the GLM side, ~2x under).
-      pool_address: "0x531b6a4b3f962208ea8ed5268c642c84bb29be0b"
-      fee_tier: 10000
-      route: # USDT -> WETH (0.05%) -> GLM (1%)
-        - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", fee_tier: 500 }
+      venue: uniswap_v2
+      # Most GLM DEX liquidity sits in the Uniswap v2 GLM/WETH pair; the
+      # pair address is derived from the v2 factory at startup (a configured
+      # one would be verified against it). Routed-pair TVL prices only the
+      # GLM side (~2x understated).
+      pool_address: "" # factory-derived
+      route: # USDT -> WETH -> GLM (0.3% v2 fee per hop)
+        - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" } # WETH
       base_token: { address: "0x7DD9c5Cba05E151C895FDe1CF355C9A1D5DA6429" }  # GLM
       quote_token: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" } # USDT
+      # v3 alternative (thin, ~$55k): venue uniswap_v3, fee_tier 10000,
+      # pool 0x531b6a4b3f962208ea8ed5268c642c84bb29be0b, WETH hop fee 500.
     trade_sizes_usd: [100, 500, 1000]
     min_pool_tvl_usd: 200000
+    momentum_threshold_bps: 30

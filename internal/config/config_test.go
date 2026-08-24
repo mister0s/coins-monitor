@@ -29,11 +29,38 @@ func TestLoadShippedConfig(t *testing.T) {
 	if p := byName["POL/USDT"]; p.CEX.Symbol != "POLUSDT" {
 		t.Errorf("POL cex symbol override = %q", p.CEX.Symbol)
 	}
-	if p := byName["GLM/USDT"]; len(p.DEX.Route) != 1 || p.DEX.Route[0].FeeTier != 500 {
-		t.Errorf("GLM route = %+v", p.DEX.Route)
+	if p := byName["GLM/USDT"]; p.DEX.Venue != "uniswap_v2" || len(p.DEX.Route) != 1 ||
+		p.DEX.Route[0].Token != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" {
+		t.Errorf("GLM should route via WETH on uniswap_v2: %+v", p.DEX)
 	}
-	if cfg.PollInterval.Std() != 15*time.Second {
+	if p := byName["FLUX/USDT"]; p.DEX.Venue != "uniswap_v2" || p.DEX.PoolAddress != "" {
+		t.Errorf("FLUX should be uniswap_v2 with factory-derived pool: %+v", p.DEX)
+	}
+	if p := byName["ACX/USDT"]; p.EffectiveMomentumThreshold(cfg.MomentumThresholdBps) != 30 {
+		t.Errorf("ACX momentum threshold = %v, want 30", p.EffectiveMomentumThreshold(cfg.MomentumThresholdBps))
+	}
+	if p := byName["AVAX/USDT"]; p.EffectiveMomentumThreshold(cfg.MomentumThresholdBps) != 10 {
+		t.Errorf("AVAX momentum threshold should inherit global 10")
+	}
+	if cfg.PollInterval.Std() != 2*time.Second {
 		t.Errorf("poll interval = %v", cfg.PollInterval.Std())
+	}
+	if cfg.MaxLegSkew.Std() != 3*time.Second {
+		t.Errorf("max_leg_skew = %v", cfg.MaxLegSkew.Std())
+	}
+	// SOL overrides its interval for the Jupiter free-tier budget; the EVM
+	// pairs inherit the global one.
+	if p := byName["SOL/USDT"]; p.EffectiveInterval(cfg.PollInterval).Std() != 10*time.Second {
+		t.Errorf("SOL poll interval = %v", p.EffectiveInterval(cfg.PollInterval).Std())
+	}
+	if p := byName["AVAX/USDT"]; p.EffectiveInterval(cfg.PollInterval).Std() != 2*time.Second {
+		t.Errorf("AVAX poll interval = %v", p.EffectiveInterval(cfg.PollInterval).Std())
+	}
+	if got := cfg.RateLimitFor("solana"); got != 1 {
+		t.Errorf("solana rate limit = %v, want 1", got)
+	}
+	if got := cfg.RateLimitFor("unknown-chain"); got != DefaultRateLimitRPS {
+		t.Errorf("default rate limit = %v", got)
 	}
 }
 

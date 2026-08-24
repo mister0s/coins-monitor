@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mister0s/coins-monitor/internal/evm"
+	"github.com/mister0s/coins-monitor/internal/ratelimit"
 )
 
 // DefaultJupiterQuoteURL is Jupiter's free public quote endpoint.
@@ -27,9 +28,10 @@ type Jupiter struct {
 	baseDecimals  int
 	quoteDecimals int
 	hc            *http.Client
+	limiter       *ratelimit.Limiter // nil = unlimited
 }
 
-func NewJupiter(quoteURL, baseMint string, baseDecimals int, quoteMint string, quoteDecimals int) (*Jupiter, error) {
+func NewJupiter(quoteURL, baseMint string, baseDecimals int, quoteMint string, quoteDecimals int, limiter *ratelimit.Limiter) (*Jupiter, error) {
 	if quoteURL == "" {
 		quoteURL = DefaultJupiterQuoteURL
 	}
@@ -46,10 +48,13 @@ func NewJupiter(quoteURL, baseMint string, baseDecimals int, quoteMint string, q
 		baseDecimals:  baseDecimals,
 		quoteDecimals: quoteDecimals,
 		hc:            &http.Client{Timeout: 15 * time.Second},
+		limiter:       limiter,
 	}, nil
 }
 
 func (j *Jupiter) Venue() string { return "jupiter" }
+
+func (j *Jupiter) Source() string { return j.quoteURL }
 
 type jupiterQuote struct {
 	OutAmount string `json:"outAmount"`
@@ -59,6 +64,9 @@ type jupiterQuote struct {
 func (j *Jupiter) quote(ctx context.Context, inputMint, outputMint string, amountIn *big.Int) (*big.Int, error) {
 	if amountIn.Sign() <= 0 {
 		return nil, fmt.Errorf("jupiter: non-positive amountIn")
+	}
+	if err := j.limiter.Wait(ctx); err != nil {
+		return nil, err
 	}
 	q := url.Values{}
 	q.Set("inputMint", inputMint)

@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -66,7 +67,10 @@ type DexConfig struct {
 	// uniswap_v3
 	QuoterAddress string     `yaml:"quoter_address"` // QuoterV2; defaulted per chain if empty
 	FeeTier       uint32     `yaml:"fee_tier"`
-	Route         []RouteHop `yaml:"route"` // optional intermediate hops (multi-hop path)
+	Route         []RouteHop `yaml:"route"` // optional intermediate hops (fee_tier unused for v2)
+
+	// uniswap_v2
+	RouterAddress string `yaml:"router_address"` // defaults to UniswapV2Router02 on Ethereum
 
 	// EVM venues
 	BaseToken  Token `yaml:"base_token"`
@@ -76,6 +80,14 @@ type DexConfig struct {
 	QuoteURL  string `yaml:"quote_url"` // defaults to the public lite endpoint
 	BaseMint  string `yaml:"base_mint"`
 	QuoteMint string `yaml:"quote_mint"`
+
+	// QuoteBasisSymbol names a CEX symbol (e.g. USDCUSDT) whose mid converts
+	// this DEX's quote-token units into the CEX pair's quote units. Set it
+	// when the DEX pool is quoted in a different stablecoin than the CEX
+	// pair, so the basis (e.g. a USDC/USDT depeg of a few bps) is measured
+	// per sample instead of assumed to be exactly 1. Samples store both the
+	// raw and the basis-corrected edge.
+	QuoteBasisSymbol string `yaml:"quote_basis_symbol"`
 }
 
 type Pair struct {
@@ -86,6 +98,29 @@ type Pair struct {
 	DEX           DexConfig `yaml:"dex"`
 	TradeSizesUSD []float64 `yaml:"trade_sizes_usd"`
 	MinPoolTVLUSD float64   `yaml:"min_pool_tvl_usd"`
+	// PollInterval overrides the global poll_interval for this pair (e.g. to
+	// slow down a pair on a rate-limited endpoint).
+	PollInterval Duration `yaml:"poll_interval"`
+	// MomentumThresholdBps overrides the global momentum_threshold_bps: the
+	// 10s CEX-mid move separating the flat bucket from strong up/down.
+	// Scale it to the pair's volatility so "flat" keeps most samples.
+	MomentumThresholdBps float64 `yaml:"momentum_threshold_bps"`
+}
+
+// EffectiveMomentumThreshold returns this pair's momentum bucket threshold.
+func (p Pair) EffectiveMomentumThreshold(global float64) float64 {
+	if p.MomentumThresholdBps > 0 {
+		return p.MomentumThresholdBps
+	}
+	return global
+}
+
+// EffectiveInterval returns this pair's sampling interval.
+func (p Pair) EffectiveInterval(global Duration) Duration {
+	if p.PollInterval > 0 {
+		return p.PollInterval
+	}
+	return global
 }
 
 func (p Pair) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
@@ -99,14 +134,41 @@ func (p Pair) BaseSymbol() string {
 }
 
 type Config struct {
-	PollInterval       Duration          `yaml:"poll_interval"`
-	TVLRefreshInterval Duration          `yaml:"tvl_refresh_interval"`
-	SummaryInterval    Duration          `yaml:"summary_interval"`
-	MaxBookAge         Duration          `yaml:"max_book_age"` // reject CEX quotes older than this
-	DataDir            string            `yaml:"data_dir"`
-	Chains             map[string]string `yaml:"chains"` // chain -> JSON-RPC URL (supports ${ENV} expansion)
-	Costs              Costs             `yaml:"costs"`
-	Pairs              []Pair            `yaml:"pairs"`
+	PollInterval       Duration `yaml:"poll_interval"`
+	TVLRefreshInterval Duration `yaml:"tvl_refresh_interval"`
+	SummaryInterval    Duration `yaml:"summary_interval"`
+	MaxBookAge         Duration `yaml:"max_book_age"` // reject CEX quotes older than this
+	// MaxLegSkew is the maximum |dex_ts - cex_ts| for a sample to count in
+	// profitability stats; larger-skew samples are recorded but excluded.
+	MaxLegSkew Duration `yaml:"max_leg_skew"`
+	// MomentumThresholdBps is the default flat-vs-strong momentum bucket
+	// threshold (10s CEX mid move, bps); per-pair overridable.
+	MomentumThresholdBps float64 `yaml:"momentum_threshold_bps"`
+	DataDir              string  `yaml:"data_dir"`
+	// DBPath is the SQLite database samples are recorded to.
+	DBPath string `yaml:"db_path"`
+	// Retention: on start and daily, samples older than this window are
+	// archived to compressed JSONL under ArchiveDir and vacuumed away.
+	Retention  Duration          `yaml:"retention"`
+	ArchiveDir string            `yaml:"archive_dir"`
+	Chains     map[string]string `yaml:"chains"` // chain -> JSON-RPC URL (supports ${ENV} expansion)
+	// RateLimitRPS caps outbound quote/TVL requests per endpoint, keyed by
+	// chain name ("solana" covers the Jupiter quote API). One shared limiter
+	// per endpoint paces and staggers all pairs using it. 0/absent = default.
+	RateLimitRPS map[string]float64 `yaml:"rate_limit_rps"`
+	Costs        Costs              `yaml:"costs"`
+	Pairs        []Pair             `yaml:"pairs"`
+}
+
+// DefaultRateLimitRPS applies when rate_limit_rps has no entry for a chain.
+const DefaultRateLimitRPS = 10.0
+
+// RateLimitFor returns the configured RPS cap for an endpoint key.
+func (c *Config) RateLimitFor(chain string) float64 {
+	if v, ok := c.RateLimitRPS[chain]; ok {
+		return v
+	}
+	return DefaultRateLimitRPS
 }
 
 // Load reads, env-expands, parses and validates the config file.
@@ -133,7 +195,13 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) applyDefaults() {
 	if c.PollInterval == 0 {
-		c.PollInterval = Duration(15 * time.Second)
+		c.PollInterval = Duration(2 * time.Second)
+	}
+	if c.MaxLegSkew == 0 {
+		c.MaxLegSkew = Duration(3 * time.Second)
+	}
+	if c.MomentumThresholdBps == 0 {
+		c.MomentumThresholdBps = 10
 	}
 	if c.TVLRefreshInterval == 0 {
 		c.TVLRefreshInterval = Duration(10 * time.Minute)
@@ -146,6 +214,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.DataDir == "" {
 		c.DataDir = "data"
+	}
+	if c.DBPath == "" {
+		c.DBPath = filepath.Join(c.DataDir, "monitor.db")
+	}
+	if c.Retention == 0 {
+		c.Retention = Duration(30 * 24 * time.Hour)
+	}
+	if c.ArchiveDir == "" {
+		c.ArchiveDir = filepath.Join(c.DataDir, "archive")
 	}
 	for i := range c.Pairs {
 		p := &c.Pairs[i]
@@ -201,7 +278,7 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: %s: unsupported cex venue %q", p.Symbol, p.CEX.Venue)
 		}
 		switch p.DEX.Venue {
-		case "uniswap_v3", "lfj", "velodrome", "jupiter":
+		case "uniswap_v2", "uniswap_v3", "lfj", "velodrome", "jupiter":
 		default:
 			return fmt.Errorf("config: %s: unsupported dex venue %q", p.Symbol, p.DEX.Venue)
 		}

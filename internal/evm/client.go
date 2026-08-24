@@ -16,20 +16,29 @@ import (
 	"time"
 
 	"golang.org/x/crypto/sha3"
+
+	"github.com/mister0s/coins-monitor/internal/ratelimit"
 )
 
 type Client struct {
-	url string
-	hc  *http.Client
-	id  atomic.Int64
+	url     string
+	hc      *http.Client
+	id      atomic.Int64
+	limiter *ratelimit.Limiter // nil = unlimited
 }
 
-func NewClient(rpcURL string) *Client {
+// NewClient creates a read-only JSON-RPC client. A non-nil limiter paces all
+// requests through this client (shared across every pair on the chain).
+func NewClient(rpcURL string, limiter *ratelimit.Limiter) *Client {
 	return &Client{
-		url: rpcURL,
-		hc:  &http.Client{Timeout: 15 * time.Second},
+		url:     rpcURL,
+		hc:      &http.Client{Timeout: 15 * time.Second},
+		limiter: limiter,
 	}
 }
+
+// URL returns the RPC endpoint this client talks to.
+func (c *Client) URL() string { return c.url }
 
 type rpcRequest struct {
 	JSONRPC string        `json:"jsonrpc"`
@@ -50,6 +59,9 @@ type rpcResponse struct {
 
 // Call performs eth_call against `to` with the given calldata at the latest block.
 func (c *Client) Call(ctx context.Context, to string, data []byte) ([]byte, error) {
+	if err := c.limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
 	req := rpcRequest{
 		JSONRPC: "2.0",
 		ID:      c.id.Add(1),

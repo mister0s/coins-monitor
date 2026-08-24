@@ -28,7 +28,7 @@ func TestJupiterQuote(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	j, err := NewJupiter(srv.URL, "SOLMINT", 9, "USDTMINT", 6)
+	j, err := NewJupiter(srv.URL, "SOLMINT", 9, "USDTMINT", 6, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

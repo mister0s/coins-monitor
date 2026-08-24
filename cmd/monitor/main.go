@@ -18,6 +18,8 @@ import (
 	"github.com/mister0s/coins-monitor/internal/dex"
 	"github.com/mister0s/coins-monitor/internal/engine"
 	"github.com/mister0s/coins-monitor/internal/evm"
+	"github.com/mister0s/coins-monitor/internal/ratelimit"
+	"github.com/mister0s/coins-monitor/internal/store"
 )
 
 func main() {
@@ -46,6 +48,19 @@ func run(configPath string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// One rate limiter per endpoint key (chain name; "solana" covers the
+	// Jupiter quote API): every pair on the endpoint shares it, which caps
+	// the request rate and interleaves concurrent pollers.
+	limiters := map[string]*ratelimit.Limiter{}
+	limiterFor := func(key string) *ratelimit.Limiter {
+		if l, ok := limiters[key]; ok {
+			return l
+		}
+		l := ratelimit.New(cfg.RateLimitFor(key))
+		limiters[key] = l
+		return l
+	}
+
 	clients := map[string]*evm.Client{} // chain -> client
 	clientFor := func(chain string) (*evm.Client, error) {
 		if c, ok := clients[chain]; ok {
@@ -55,7 +70,7 @@ func run(configPath string, log *slog.Logger) error {
 		if !ok || rpcURL == "" {
 			return nil, fmt.Errorf("no RPC URL configured for chain %q (set chains.%s, env-expandable)", chain, chain)
 		}
-		c := evm.NewClient(rpcURL)
+		c := evm.NewClient(rpcURL, limiterFor(chain))
 		clients[chain] = c
 		return c, nil
 	}
@@ -72,7 +87,7 @@ func run(configPath string, log *slog.Logger) error {
 			log.Info("pair disabled in config; skipping", "pair", p.Symbol)
 			continue
 		}
-		q, err := buildQuoter(ctx, p, clientFor)
+		q, err := buildQuoter(ctx, p, clientFor, limiterFor)
 		if err != nil {
 			log.Warn("pair skipped: DEX side not usable", "pair", p.Symbol, "err", err)
 			continue
@@ -107,11 +122,29 @@ func run(configPath string, log *slog.Logger) error {
 				"venue", c.pair.CEX.Venue, "cex_symbol", c.pair.CEX.Symbol, "err", err)
 			continue
 		}
+		// A quote-basis symbol (e.g. USDCUSDT) rides on the same feed; if it
+		// can't be confirmed, the pair still runs but records raw-only.
+		if bs := c.pair.DEX.QuoteBasisSymbol; bs != "" {
+			bctx, bcancel := context.WithTimeout(ctx, 15*time.Second)
+			err := probe.ValidateSymbol(bctx, bs)
+			bcancel()
+			if err != nil {
+				log.Warn("quote-basis symbol not confirmed; recording raw edges only",
+					"pair", c.pair.Symbol, "basis", bs, "err", err)
+				c.pair.DEX.QuoteBasisSymbol = ""
+			}
+		}
 		switch c.pair.CEX.Venue {
 		case "binance":
-			binanceSymbols = append(binanceSymbols, c.pair.CEX.Symbol)
+			binanceSymbols = appendUnique(binanceSymbols, c.pair.CEX.Symbol)
+			if bs := c.pair.DEX.QuoteBasisSymbol; bs != "" {
+				binanceSymbols = appendUnique(binanceSymbols, bs)
+			}
 		case "kucoin":
-			kucoinSymbols = append(kucoinSymbols, c.pair.CEX.Symbol)
+			kucoinSymbols = appendUnique(kucoinSymbols, c.pair.CEX.Symbol)
+			if bs := c.pair.DEX.QuoteBasisSymbol; bs != "" {
+				kucoinSymbols = appendUnique(kucoinSymbols, bs)
+			}
 		}
 		runners = append(runners, &engine.PairRunner{Pair: c.pair, Quoter: c.quoter})
 	}
@@ -139,11 +172,22 @@ func run(configPath string, log *slog.Logger) error {
 		}
 	}
 
-	w, err := engine.NewJSONLWriter(cfg.DataDir)
-	if err != nil {
-		return err
+	// Startup self-test: one LIVE quote per venue, printed with its
+	// timestamp, before any sampling starts. A failing venue is reported
+	// explicitly — the monitor never proceeds quietly past a dead feed.
+	if failures := selfTest(ctx, log, runners); failures > 0 {
+		log.Warn("SELF-TEST: some venues FAILED — their pairs will record nothing until the venue recovers",
+			"failed", failures)
+	} else {
+		log.Info("SELF-TEST: all venues returned live quotes")
 	}
-	defer w.Close()
+
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("open sample store: %w", err)
+	}
+	defer st.Close()
+	go retentionLoop(ctx, st, cfg, log)
 
 	for _, f := range feeds {
 		f.Start(ctx)
@@ -151,7 +195,7 @@ func run(configPath string, log *slog.Logger) error {
 	log.Info("monitor started",
 		"pairs", len(runners),
 		"poll_interval", cfg.PollInterval.Std(),
-		"data_dir", cfg.DataDir,
+		"db", cfg.DBPath,
 	)
 	for _, r := range runners {
 		log.Info("monitoring",
@@ -160,9 +204,97 @@ func run(configPath string, log *slog.Logger) error {
 			"sizes_usd", r.Pair.TradeSizesUSD)
 	}
 
-	engine.New(cfg, log, w, runners).Run(ctx)
+	engine.New(cfg, log, st, runners).Run(ctx)
 	log.Info("monitor stopped")
 	return nil
+}
+
+// retentionLoop archives samples older than the retention window to
+// compressed JSONL and vacuums, on start and then daily.
+func retentionLoop(ctx context.Context, st *store.Store, cfg *config.Config, log *slog.Logger) {
+	run := func() {
+		cutoff := time.Now().Add(-cfg.Retention.Std())
+		n, path, err := st.Retain(cutoff, cfg.ArchiveDir)
+		switch {
+		case err != nil:
+			log.Error("retention failed", "err", err)
+		case n > 0:
+			log.Info("retention: archived old samples", "rows", n, "archive", path)
+		}
+	}
+	run()
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			run()
+		}
+	}
+}
+
+func appendUnique(list []string, s string) []string {
+	for _, v := range list {
+		if v == s {
+			return list
+		}
+	}
+	return append(list, s)
+}
+
+// selfTest fetches one live quote per configured venue leg and prints each
+// with its receive timestamp; failures are named explicitly. Returns the
+// number of failed legs.
+func selfTest(ctx context.Context, log *slog.Logger, runners []*engine.PairRunner) int {
+	failures := 0
+	cexSnapshot := func(p config.Pair, symbol string) (cex.Book, error) {
+		sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		switch p.CEX.Venue {
+		case "binance":
+			return cex.SnapshotBinance(sctx, p.CEX.RestEndpoint, symbol)
+		case "kucoin":
+			return cex.SnapshotKucoin(sctx, p.CEX.RestEndpoint, symbol)
+		}
+		return cex.Book{}, fmt.Errorf("unsupported venue %q", p.CEX.Venue)
+	}
+	for _, r := range runners {
+		p := r.Pair
+		if book, err := cexSnapshot(p, p.CEX.Symbol); err != nil {
+			failures++
+			log.Error("SELF-TEST FAILED: CEX leg", "pair", p.Symbol, "venue", p.CEX.Venue,
+				"symbol", p.CEX.Symbol, "err", err)
+		} else {
+			log.Info("self-test: CEX live quote", "pair", p.Symbol, "venue", p.CEX.Venue,
+				"bid", book.Bid, "ask", book.Ask, "ts", book.Ts.UTC().Format(time.RFC3339Nano))
+		}
+		if bs := p.DEX.QuoteBasisSymbol; bs != "" {
+			if book, err := cexSnapshot(p, bs); err != nil {
+				failures++
+				log.Error("SELF-TEST FAILED: quote-basis leg", "pair", p.Symbol, "basis", bs, "err", err)
+			} else {
+				log.Info("self-test: basis live quote", "pair", p.Symbol, "basis", bs,
+					"mid", book.Mid(), "ts", book.Ts.UTC().Format(time.RFC3339Nano))
+			}
+		}
+		qctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		baseOut, err := r.Quoter.QuoteBuyBase(qctx, p.TradeSizesUSD[0])
+		cancel()
+		ts := time.Now()
+		if err != nil || baseOut <= 0 {
+			failures++
+			log.Error("SELF-TEST FAILED: DEX leg", "pair", p.Symbol, "venue", r.Quoter.Venue(),
+				"source", r.Quoter.Source(), "err", err)
+			continue
+		}
+		log.Info("self-test: DEX live quote", "pair", p.Symbol, "venue", r.Quoter.Venue(),
+			"size_usd", p.TradeSizesUSD[0],
+			"effective_price", fmt.Sprintf("%.6f", p.TradeSizesUSD[0]/baseOut),
+			"source", r.Quoter.Source(), "ts", ts.UTC().Format(time.RFC3339Nano))
+	}
+	return failures
 }
 
 // probeFeed returns a symbol-less feed used only for listing validation.
@@ -177,10 +309,10 @@ func probeFeed(p config.Pair, cfg *config.Config, log *slog.Logger) (cex.Feed, e
 	}
 }
 
-func buildQuoter(ctx context.Context, p config.Pair, clientFor func(string) (*evm.Client, error)) (dex.Quoter, error) {
+func buildQuoter(ctx context.Context, p config.Pair, clientFor func(string) (*evm.Client, error), limiterFor func(string) *ratelimit.Limiter) (dex.Quoter, error) {
 	d := p.DEX
 	if d.Venue == "jupiter" {
-		return dex.NewJupiter(d.QuoteURL, d.BaseMint, d.BaseToken.Decimals, d.QuoteMint, d.QuoteToken.Decimals)
+		return dex.NewJupiter(d.QuoteURL, d.BaseMint, d.BaseToken.Decimals, d.QuoteMint, d.QuoteToken.Decimals, limiterFor(d.Chain))
 	}
 
 	client, err := clientFor(d.Chain)
@@ -197,6 +329,15 @@ func buildQuoter(ctx context.Context, p config.Pair, clientFor func(string) (*ev
 	}
 
 	switch d.Venue {
+	case "uniswap_v2":
+		route := make([]string, 0, len(d.Route))
+		for _, h := range d.Route {
+			route = append(route, h.Token)
+		}
+		ictx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return dex.NewUniswapV2(ictx, client, d.RouterAddress, d.PoolAddress,
+			d.BaseToken.Address, baseDec, d.QuoteToken.Address, quoteDec, route)
 	case "uniswap_v3":
 		route := make([]dex.PathHop, 0, len(d.Route))
 		for _, h := range d.Route {

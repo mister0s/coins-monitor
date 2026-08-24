@@ -7,11 +7,15 @@ import (
 	"time"
 )
 
-// Book is a top-of-book snapshot for one symbol.
+// Book is a top-of-book snapshot for one symbol. Ts is the local receive
+// time; Source and ConnID record where the quote physically came from
+// (endpoint URL and connection instance) for sample provenance.
 type Book struct {
-	Bid float64
-	Ask float64
-	Ts  time.Time
+	Bid    float64
+	Ask    float64
+	Ts     time.Time
+	Source string
+	ConnID string
 }
 
 func (b Book) Mid() float64 { return (b.Bid + b.Ask) / 2 }

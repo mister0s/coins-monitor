@@ -75,7 +75,14 @@ func (f *KucoinFeed) fetch(ctx context.Context, symbol string) (Book, error) {
 	if err1 != nil || err2 != nil || bid <= 0 || ask <= 0 {
 		return Book{}, fmt.Errorf("bad level1 quote for %s: bid=%q ask=%q", symbol, out.Data.BestBid, out.Data.BestAsk)
 	}
-	return Book{Bid: bid, Ask: ask, Ts: time.Now()}, nil
+	return Book{Bid: bid, Ask: ask, Ts: time.Now(), Source: f.restEndpoint, ConnID: "kucoin-rest"}, nil
+}
+
+// SnapshotKucoin fetches one live level-1 quote — used by the startup
+// self-test.
+func SnapshotKucoin(ctx context.Context, restEndpoint, symbol string) (Book, error) {
+	f := NewKucoinFeed(restEndpoint, nil, 2*time.Second, slog.Default())
+	return f.fetch(ctx, strings.ToUpper(symbol))
 }
 
 func (f *KucoinFeed) ValidateSymbol(ctx context.Context, symbol string) error {

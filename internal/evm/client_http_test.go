@@ -58,7 +58,7 @@ func TestClientCallRoundTrip(t *testing.T) {
 	})
 	defer srv.Close()
 
-	c := NewClient(srv.URL)
+	c := NewClient(srv.URL, nil)
 	d, err := c.ERC20Decimals(context.Background(), token)
 	if err != nil {
 		t.Fatal(err)

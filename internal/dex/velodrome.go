@@ -64,6 +64,8 @@ func NewVelodrome(ctx context.Context, client *evm.Client, pool, baseToken strin
 
 func (v *Velodrome) Venue() string { return "velodrome" }
 
+func (v *Velodrome) Source() string { return v.client.URL() }
+
 func (v *Velodrome) getAmountOut(ctx context.Context, amountIn *big.Int, tokenIn string) (*big.Int, error) {
 	if amountIn.Sign() <= 0 {
 		return nil, fmt.Errorf("velodrome: non-positive amountIn")
