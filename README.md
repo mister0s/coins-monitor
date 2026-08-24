@@ -112,7 +112,39 @@ the edge-weighted mean duration (a long marginal window counts less than a
 short fat one). Window durations are upper bounds at the achieved sampling
 resolution, which the report prints per series (`res_s`).
 
-`-include-excluded` includes TVL-gated samples in the distributions.
+`-include-excluded` includes TVL/skew-gated samples in the distributions.
+
+### Diagnostics: is a persistent edge real?
+
+A one-directional edge that never goes away is usually a measurement
+artifact, not free money. The report includes three artifact detectors, plus
+a manual verification tool — all additive (raw fields are never altered, so
+historical data stays comparable):
+
+1. **Quote-basis correction** — when a pair sets `quote_basis_symbol` (e.g.
+   `USDCUSDT` for the USDC-quoted LFJ AVAX pool vs the USDT-quoted CEX
+   pair), the monitor streams that symbol from the same feed and stores
+   basis-corrected edges (`*_adj_bps`) alongside raw ones. The report
+   re-runs the window analysis on corrected data; **`surv%`** says how much
+   of the raw net-positive time survives. Near 100% → real; near 0% → you
+   were measuring the stablecoin basis.
+2. **Momentum correlation** — each sample records the CEX mid's change over
+   the prior ~10s. The report buckets corrected net edge by momentum
+   (down/flat/up, threshold `-momentum-threshold`, default 10 bps). Positive
+   edge concentrated in the **up** bucket means the DEX quote lags a rising
+   CEX price — latency skew, not capturable opportunity.
+3. **Persistence profile** — hourly medians of raw vs corrected net edge
+   (`-hourly`). A flat persistent raw-vs-adj offset points at the quote
+   basis; isolated spiky hours point at genuine dislocations.
+4. **Spot-check** — verify one window end-to-end by hand:
+
+   ```sh
+   go run ./cmd/spotcheck -pair AVAX/USDT -at 2026-08-24T12:34:56Z -window 30s
+   ```
+
+   dumps every recorded leg (CEX bid/ask, DEX effective prices, basis mid,
+   skew, momentum, exclusion flags) around the timestamp, plus the Binance
+   1s klines for the same interval.
 
 ## Configuration
 

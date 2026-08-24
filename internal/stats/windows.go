@@ -35,15 +35,25 @@ type WindowStats struct {
 	TotalPosS float64 // total net-positive seconds (upper bound)
 }
 
-// FindWindows groups consecutive net-positive samples into windows.
+// FindWindows groups consecutive net-positive samples (raw edge) into windows.
+func FindWindows(a *Agg) WindowStats {
+	return findWindows(a.Key, a.Ts, a.Net)
+}
+
+// FindWindowsAdj is FindWindows over the quote-basis-corrected edge.
+func FindWindowsAdj(a *Agg) WindowStats {
+	return findWindows(a.Key, a.Ts, a.NetAdj)
+}
+
+// findWindows groups consecutive net-positive samples into windows.
 //
 // Samples are sorted by timestamp; the series' median inter-sample gap sets
 // the resolution. A run breaks when a sample is non-positive or when the gap
 // to the next sample exceeds 3x the median spacing (a data gap: monitor
 // restart, feed outage) — windows never bridge unobserved time.
-func FindWindows(a *Agg) WindowStats {
-	ws := WindowStats{Key: a.Key}
-	n := len(a.Net)
+func findWindows(key Key, tss []time.Time, nets []float64) WindowStats {
+	ws := WindowStats{Key: key}
+	n := len(nets)
 	if n == 0 {
 		return ws
 	}
@@ -51,12 +61,12 @@ func FindWindows(a *Agg) WindowStats {
 	for i := range idx {
 		idx[i] = i
 	}
-	sort.Slice(idx, func(x, y int) bool { return a.Ts[idx[x]].Before(a.Ts[idx[y]]) })
+	sort.Slice(idx, func(x, y int) bool { return tss[idx[x]].Before(tss[idx[y]]) })
 
 	// Median spacing = the sampling resolution actually achieved.
 	var gaps []float64
 	for k := 1; k < n; k++ {
-		gaps = append(gaps, a.Ts[idx[k]].Sub(a.Ts[idx[k-1]]).Seconds())
+		gaps = append(gaps, tss[idx[k]].Sub(tss[idx[k-1]]).Seconds())
 	}
 	spacing := 2.0 // fallback for a single-sample series
 	if len(gaps) > 0 {
@@ -83,7 +93,7 @@ func FindWindows(a *Agg) WindowStats {
 	}
 	for k := 0; k < n; k++ {
 		i := idx[k]
-		ts, net := a.Ts[i], a.Net[i]
+		ts, net := tss[i], nets[i]
 		if net <= 0 {
 			flush()
 			continue

@@ -33,6 +33,62 @@ type PairRunner struct {
 	tvlAt       time.Time
 	lastBestNet float64
 	lastSample  time.Time
+	midHistory  []midPoint // recent CEX mids for the momentum diagnostic
+}
+
+type midPoint struct {
+	ts  time.Time
+	mid float64
+}
+
+const (
+	momentumLookback  = 10 * time.Second
+	momentumTolerance = 11 * time.Second // accept a reference mid 9..21s old
+	midHistoryKeep    = 40 * time.Second
+)
+
+// recordMid appends a mid observation and prunes old history.
+func (r *PairRunner) recordMid(ts time.Time, mid float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n := len(r.midHistory); n > 0 && !ts.After(r.midHistory[n-1].ts) {
+		return
+	}
+	r.midHistory = append(r.midHistory, midPoint{ts, mid})
+	cutoff := ts.Add(-midHistoryKeep)
+	drop := 0
+	for drop < len(r.midHistory) && r.midHistory[drop].ts.Before(cutoff) {
+		drop++
+	}
+	r.midHistory = r.midHistory[drop:]
+}
+
+// momentum10s returns the CEX mid's change (bps) over the ~10s before now,
+// using the recorded history point closest to 10s old. ok is false when no
+// point in the 9..21s age range exists (e.g. right after startup).
+func (r *PairRunner) momentum10s(now time.Time, mid float64) (float64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var best *midPoint
+	var bestDiff time.Duration
+	for i := range r.midHistory {
+		p := &r.midHistory[i]
+		age := now.Sub(p.ts)
+		if age < momentumLookback-time.Second || age > momentumLookback+momentumTolerance {
+			continue
+		}
+		diff := age - momentumLookback
+		if diff < 0 {
+			diff = -diff
+		}
+		if best == nil || diff < bestDiff {
+			best, bestDiff = p, diff
+		}
+	}
+	if best == nil || best.mid <= 0 {
+		return 0, false
+	}
+	return (mid/best.mid - 1) * 1e4, true
 }
 
 // Engine drives all pair runners.
@@ -143,6 +199,8 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 	if !ok {
 		return
 	}
+	r.recordMid(book.Ts, book.Mid())
+	momentumBps, momentumOK := r.momentum10s(book.Ts, book.Mid())
 	r.refreshTVL(ctx, book.Mid())
 	r.mu.Lock()
 	tvl := r.tvlUSD
@@ -182,6 +240,20 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 		}
 		maxSkew := r.cfg.MaxLegSkew.Std()
 		skewOK := maxSkew <= 0 || skew <= maxSkew
+
+		// Quote-basis conversion (e.g. USDCUSDT mid) from the same feed;
+		// 0 when unconfigured or the basis book is missing/stale, which
+		// computeEdges treats as identity (adj == raw).
+		basisSym := r.Pair.DEX.QuoteBasisSymbol
+		var basisMid float64
+		if basisSym != "" {
+			if bb, bok := r.Feed.Book(basisSym); bok &&
+				time.Since(bb.Ts) <= r.cfg.MaxBookAge.Std() && bb.Mid() > 0 {
+				basisMid = bb.Mid()
+			} else {
+				r.log.Debug("quote-basis book unavailable; recording raw only", "basis", basisSym)
+			}
+		}
 		var reasons []string
 		if !tvlOK {
 			reasons = append(reasons, "tvl")
@@ -209,10 +281,14 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 			CexFeeBps:      r.cfg.Costs.CexTakerFeeBps,
 			GasUSD:         gasUSD,
 			BufferBps:      r.cfg.Costs.ExtraBufferBps,
-			PoolTVLUSD:     tvl,
-			MinPoolTVLUSD:  r.Pair.MinPoolTVLUSD,
-			IncludeInStats: len(reasons) == 0,
-			ExcludeReason:  strings.Join(reasons, "+"),
+			PoolTVLUSD:      tvl,
+			MinPoolTVLUSD:   r.Pair.MinPoolTVLUSD,
+			IncludeInStats:  len(reasons) == 0,
+			ExcludeReason:   strings.Join(reasons, "+"),
+			BasisSymbol:     basisSym,
+			BasisMid:        basisMid,
+			CexMidChg10sBps: momentumBps,
+			MomentumOK:      momentumOK,
 		}
 		s.computeEdges()
 		if err := r.w.Write(s); err != nil {

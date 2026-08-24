@@ -43,6 +43,28 @@ type Sample struct {
 	GrossBuyCexSellDexBps float64 `json:"gross_buy_cex_sell_dex_bps"`
 	NetBuyCexSellDexBps   float64 `json:"net_buy_cex_sell_dex_bps"`
 
+	// Quote-basis correction. When the DEX pool is quoted in a different
+	// stablecoin than the CEX pair (e.g. LFJ WAVAX/USDC vs Binance
+	// AVAX/USDT), BasisSymbol/BasisMid record the live conversion (e.g.
+	// USDCUSDT mid = USDT per USDC) and the *_adj_bps fields re-express the
+	// DEX leg in CEX-quote terms. With no basis configured, or when the
+	// basis book is unavailable (BasisMid 0), adj == raw. Raw fields are
+	// never altered, so historical data stays comparable.
+	BasisSymbol              string  `json:"basis_symbol,omitempty"`
+	BasisMid                 float64 `json:"basis_mid,omitempty"`
+	GrossBuyDexSellCexAdjBps float64 `json:"gross_buy_dex_sell_cex_adj_bps"`
+	NetBuyDexSellCexAdjBps   float64 `json:"net_buy_dex_sell_cex_adj_bps"`
+	GrossBuyCexSellDexAdjBps float64 `json:"gross_buy_cex_sell_dex_adj_bps"`
+	NetBuyCexSellDexAdjBps   float64 `json:"net_buy_cex_sell_dex_adj_bps"`
+
+	// CEX mid momentum over the ~10s before this sample, for the
+	// trend-correlation diagnostic: positive edges that concentrate in
+	// strong-up momentum are latency skew, not opportunity. MomentumOK is
+	// false when no sufficiently old mid was available (e.g. right after
+	// startup).
+	CexMidChg10sBps float64 `json:"cex_mid_chg_10s_bps"`
+	MomentumOK      bool    `json:"momentum_ok"`
+
 	// Cost inputs used for the net figures.
 	CexFeeBps float64 `json:"cex_fee_bps"`
 	GasUSD    float64 `json:"gas_usd"`
@@ -63,15 +85,26 @@ func costBps(cexFeeBps, gasUSD, bufferBps, sizeUSD float64) float64 {
 	return cexFeeBps + bufferBps + gasUSD/sizeUSD*1e4
 }
 
-// computeEdges fills the gross/net spread fields from the raw prices.
+// computeEdges fills the gross/net spread fields, raw and basis-corrected,
+// from the recorded prices. DEX prices are in DEX-quote-token units; the
+// corrected variants multiply them by BasisMid (CEX-quote per DEX-quote,
+// identity when unset) before comparing against the CEX book.
 func (s *Sample) computeEdges() {
 	costs := costBps(s.CexFeeBps, s.GasUSD, s.BufferBps, s.TradeSizeUSD)
+	basis := s.BasisMid
+	if basis <= 0 {
+		basis = 1
+	}
 	if s.DexBuyPrice > 0 {
 		s.GrossBuyDexSellCexBps = (s.CexBid/s.DexBuyPrice - 1) * 1e4
 		s.NetBuyDexSellCexBps = s.GrossBuyDexSellCexBps - costs
+		s.GrossBuyDexSellCexAdjBps = (s.CexBid/(s.DexBuyPrice*basis) - 1) * 1e4
+		s.NetBuyDexSellCexAdjBps = s.GrossBuyDexSellCexAdjBps - costs
 	}
 	if s.CexAsk > 0 {
 		s.GrossBuyCexSellDexBps = (s.DexSellPrice/s.CexAsk - 1) * 1e4
 		s.NetBuyCexSellDexBps = s.GrossBuyCexSellDexBps - costs
+		s.GrossBuyCexSellDexAdjBps = (s.DexSellPrice*basis/s.CexAsk - 1) * 1e4
+		s.NetBuyCexSellDexAdjBps = s.GrossBuyCexSellDexAdjBps - costs
 	}
 }

@@ -65,6 +65,10 @@ pairs:
       pool_address: "0x864d4e5ee7318e97483db7eb0912e09f161516ea"
       base_token: { address: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7" }  # WAVAX
       quote_token: { address: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E" } # USDC (native)
+      # The pool is USDC-quoted while the CEX pair is USDT-quoted: convert
+      # per sample using the live Binance USDCUSDT mid instead of assuming
+      # USDC == USDT. Samples store raw AND corrected edges (*_adj_bps).
+      quote_basis_symbol: USDCUSDT
     trade_sizes_usd: [1000, 5000, 20000]
     min_pool_tvl_usd: 200000
 

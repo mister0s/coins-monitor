@@ -121,11 +121,29 @@ func run(configPath string, log *slog.Logger) error {
 				"venue", c.pair.CEX.Venue, "cex_symbol", c.pair.CEX.Symbol, "err", err)
 			continue
 		}
+		// A quote-basis symbol (e.g. USDCUSDT) rides on the same feed; if it
+		// can't be confirmed, the pair still runs but records raw-only.
+		if bs := c.pair.DEX.QuoteBasisSymbol; bs != "" {
+			bctx, bcancel := context.WithTimeout(ctx, 15*time.Second)
+			err := probe.ValidateSymbol(bctx, bs)
+			bcancel()
+			if err != nil {
+				log.Warn("quote-basis symbol not confirmed; recording raw edges only",
+					"pair", c.pair.Symbol, "basis", bs, "err", err)
+				c.pair.DEX.QuoteBasisSymbol = ""
+			}
+		}
 		switch c.pair.CEX.Venue {
 		case "binance":
-			binanceSymbols = append(binanceSymbols, c.pair.CEX.Symbol)
+			binanceSymbols = appendUnique(binanceSymbols, c.pair.CEX.Symbol)
+			if bs := c.pair.DEX.QuoteBasisSymbol; bs != "" {
+				binanceSymbols = appendUnique(binanceSymbols, bs)
+			}
 		case "kucoin":
-			kucoinSymbols = append(kucoinSymbols, c.pair.CEX.Symbol)
+			kucoinSymbols = appendUnique(kucoinSymbols, c.pair.CEX.Symbol)
+			if bs := c.pair.DEX.QuoteBasisSymbol; bs != "" {
+				kucoinSymbols = appendUnique(kucoinSymbols, bs)
+			}
 		}
 		runners = append(runners, &engine.PairRunner{Pair: c.pair, Quoter: c.quoter})
 	}
@@ -177,6 +195,15 @@ func run(configPath string, log *slog.Logger) error {
 	engine.New(cfg, log, w, runners).Run(ctx)
 	log.Info("monitor stopped")
 	return nil
+}
+
+func appendUnique(list []string, s string) []string {
+	for _, v := range list {
+		if v == s {
+			return list
+		}
+	}
+	return append(list, s)
 }
 
 // probeFeed returns a symbol-less feed used only for listing validation.

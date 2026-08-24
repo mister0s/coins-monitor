@@ -26,17 +26,26 @@ type Key struct {
 }
 
 type Agg struct {
-	Key      Key
-	Ts       []time.Time // parallel to Gross/Net; not necessarily sorted
-	Gross    []float64
-	Net      []float64
+	Key   Key
+	Ts    []time.Time // parallel to the value slices; not necessarily sorted
+	Gross []float64
+	Net   []float64
+	// NetAdj is the quote-basis-corrected net edge; equal to Net when no
+	// basis is configured (identity correction) or for legacy rows recorded
+	// before the correction existed.
+	NetAdj []float64
+	// Momentum is the CEX mid change over the prior ~10s in bps; NaN when
+	// the sample had no valid momentum reference.
+	Momentum []float64
 	Excluded int // samples dropped by a quality gate (TVL / leg skew)
 }
 
-func (a *Agg) add(ts time.Time, gross, net float64) {
+func (a *Agg) add(ts time.Time, gross, net, netAdj, momentum float64) {
 	a.Ts = append(a.Ts, ts)
 	a.Gross = append(a.Gross, gross)
 	a.Net = append(a.Net, net)
+	a.NetAdj = append(a.NetAdj, netAdj)
+	a.Momentum = append(a.Momentum, momentum)
 }
 
 // LoadDir reads every *.jsonl file under dir and aggregates the samples.
@@ -84,12 +93,21 @@ func loadFile(path string, includeExcluded bool, aggs map[Key]*Agg) error {
 }
 
 func record(aggs map[Key]*Agg, s engine.Sample, includeExcluded bool) {
+	// Rows written before the basis correction existed have zero in every
+	// adj field; fall back to raw for those so old data stays usable.
+	legacy := s.GrossBuyDexSellCexAdjBps == 0 && s.NetBuyDexSellCexAdjBps == 0 &&
+		s.GrossBuyCexSellDexAdjBps == 0 && s.NetBuyCexSellDexAdjBps == 0 &&
+		(s.NetBuyDexSellCexBps != 0 || s.NetBuyCexSellDexBps != 0)
+	momentum := math.NaN()
+	if s.MomentumOK {
+		momentum = s.CexMidChg10sBps
+	}
 	for _, d := range []struct {
-		name       string
-		gross, net float64
+		name               string
+		gross, net, netAdj float64
 	}{
-		{"buy_dex_sell_cex", s.GrossBuyDexSellCexBps, s.NetBuyDexSellCexBps},
-		{"buy_cex_sell_dex", s.GrossBuyCexSellDexBps, s.NetBuyCexSellDexBps},
+		{"buy_dex_sell_cex", s.GrossBuyDexSellCexBps, s.NetBuyDexSellCexBps, s.NetBuyDexSellCexAdjBps},
+		{"buy_cex_sell_dex", s.GrossBuyCexSellDexBps, s.NetBuyCexSellDexBps, s.NetBuyCexSellDexAdjBps},
 	} {
 		k := Key{Tier: s.Tier, Symbol: s.Symbol, SizeUSD: s.TradeSizeUSD, Direction: d.name}
 		a, ok := aggs[k]
@@ -101,7 +119,11 @@ func record(aggs map[Key]*Agg, s engine.Sample, includeExcluded bool) {
 			a.Excluded++
 			continue
 		}
-		a.add(s.Ts, d.gross, d.net)
+		netAdj := d.netAdj
+		if legacy {
+			netAdj = d.net
+		}
+		a.add(s.Ts, d.gross, d.net, netAdj, momentum)
 	}
 }
 

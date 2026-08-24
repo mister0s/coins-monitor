@@ -76,6 +76,14 @@ type DexConfig struct {
 	QuoteURL  string `yaml:"quote_url"` // defaults to the public lite endpoint
 	BaseMint  string `yaml:"base_mint"`
 	QuoteMint string `yaml:"quote_mint"`
+
+	// QuoteBasisSymbol names a CEX symbol (e.g. USDCUSDT) whose mid converts
+	// this DEX's quote-token units into the CEX pair's quote units. Set it
+	// when the DEX pool is quoted in a different stablecoin than the CEX
+	// pair, so the basis (e.g. a USDC/USDT depeg of a few bps) is measured
+	// per sample instead of assumed to be exactly 1. Samples store both the
+	// raw and the basis-corrected edge.
+	QuoteBasisSymbol string `yaml:"quote_basis_symbol"`
 }
 
 type Pair struct {

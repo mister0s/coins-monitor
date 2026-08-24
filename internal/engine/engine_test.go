@@ -14,9 +14,17 @@ import (
 	"github.com/mister0s/coins-monitor/internal/config"
 )
 
-type fakeFeed struct{ book cex.Book }
+type fakeFeed struct {
+	book  cex.Book
+	books map[string]cex.Book // per-symbol overrides (e.g. a basis symbol)
+}
 
-func (f *fakeFeed) Book(string) (cex.Book, bool)                 { return f.book, true }
+func (f *fakeFeed) Book(symbol string) (cex.Book, bool) {
+	if b, ok := f.books[symbol]; ok {
+		return b, true
+	}
+	return f.book, true
+}
 func (f *fakeFeed) ValidateSymbol(context.Context, string) error { return nil }
 func (f *fakeFeed) Start(context.Context)                        {}
 func (f *fakeFeed) Venue() string                                { return "fake_cex" }
@@ -196,6 +204,89 @@ func TestSkewGateExcludes(t *testing.T) {
 	}
 	if s.CexTs.IsZero() || s.DexTs.IsZero() || !s.DexTs.After(s.CexTs) {
 		t.Errorf("leg timestamps not recorded: cex_ts=%v dex_ts=%v", s.CexTs, s.DexTs)
+	}
+}
+
+func TestQuoteBasisCorrection(t *testing.T) {
+	cfg := testConfig(t)
+	w, _ := NewJSONLWriter(cfg.DataDir)
+	defer w.Close()
+	// DEX quoted in USDC while CEX is USDT, USDC trading at 1.0005 USDT:
+	// the raw buy-DEX edge overstates reality; the corrected edge must be
+	// ~5 bps smaller.
+	pair := config.Pair{
+		Symbol: "BAS/USDT", Tier: "large",
+		CEX: config.CexConfig{Venue: "binance", Symbol: "BASUSDT"},
+		DEX: config.DexConfig{
+			Chain: "testchain", Venue: "lfj",
+			QuoteBasisSymbol: "USDCUSDT",
+		},
+		TradeSizesUSD: []float64{1000},
+	}
+	r := &PairRunner{
+		Pair: pair,
+		Feed: &fakeFeed{
+			book: cex.Book{Bid: 100.0, Ask: 100.1, Ts: time.Now()},
+			books: map[string]cex.Book{
+				"USDCUSDT": {Bid: 1.0004, Ask: 1.0006, Ts: time.Now()},
+			},
+		},
+		Quoter: &fakeQuoter{price: 99.0, skew: 0.0005, tvl: 500000},
+	}
+	New(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), w, []*PairRunner{r})
+	r.sampleOnce(context.Background())
+
+	samples := readSamples(t, cfg.DataDir, "BAS-USDT.jsonl")
+	if len(samples) != 1 {
+		t.Fatalf("samples = %d, want 1", len(samples))
+	}
+	s := samples[0]
+	if s.BasisSymbol != "USDCUSDT" || s.BasisMid < 1.0004 || s.BasisMid > 1.0006 {
+		t.Errorf("basis not recorded: symbol=%q mid=%v", s.BasisSymbol, s.BasisMid)
+	}
+	shift := s.NetBuyDexSellCexBps - s.NetBuyDexSellCexAdjBps
+	if shift < 3 || shift > 7 {
+		t.Errorf("corrected buy-DEX edge should be ~5 bps below raw, shift = %.2f", shift)
+	}
+	// The opposite direction moves the other way.
+	if s.NetBuyCexSellDexAdjBps <= s.NetBuyCexSellDexBps {
+		t.Errorf("sell-DEX corrected edge should exceed raw: raw=%v adj=%v",
+			s.NetBuyCexSellDexBps, s.NetBuyCexSellDexAdjBps)
+	}
+	// Raw values must be identical to an uncorrected computation.
+	var ref Sample
+	ref = s
+	ref.BasisMid = 0
+	ref.computeEdges()
+	if ref.NetBuyDexSellCexBps != s.NetBuyDexSellCexBps {
+		t.Error("raw fields must not be altered by the correction")
+	}
+}
+
+func TestMomentum10s(t *testing.T) {
+	r := &PairRunner{}
+	base := time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC)
+	if _, ok := r.momentum10s(base, 100); ok {
+		t.Error("no history: momentum must be unavailable")
+	}
+	r.recordMid(base, 100)
+	r.recordMid(base.Add(2*time.Second), 100.2)
+	if _, ok := r.momentum10s(base.Add(2*time.Second), 100.2); ok {
+		t.Error("only 2s of history: momentum must be unavailable")
+	}
+	now := base.Add(10 * time.Second)
+	r.recordMid(now, 101)
+	chg, ok := r.momentum10s(now, 101)
+	if !ok {
+		t.Fatal("10s-old reference exists; momentum must be available")
+	}
+	if chg < 95 || chg > 105 { // (101/100 - 1)*1e4 = 100 bps
+		t.Errorf("momentum = %.1f bps, want ~100", chg)
+	}
+	// History pruning: nothing older than ~40s survives.
+	r.recordMid(base.Add(2*time.Minute), 102)
+	if len(r.midHistory) != 1 {
+		t.Errorf("history not pruned: %d entries", len(r.midHistory))
 	}
 }
 
