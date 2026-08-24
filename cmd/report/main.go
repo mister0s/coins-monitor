@@ -22,4 +22,5 @@ func main() {
 		os.Exit(1)
 	}
 	stats.Report(os.Stdout, aggs)
+	stats.ReportWindows(os.Stdout, aggs)
 }

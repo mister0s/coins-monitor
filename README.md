@@ -12,8 +12,8 @@ aggregator-quote requests. It cannot trade.
 
 ## How it works
 
-Every `poll_interval` (default 15s), for each configured pair and each
-configured trade size:
+Every `poll_interval` (default 2s, per-pair overridable), for each configured
+pair and each configured trade size:
 
 1. **CEX side** — take the live top-of-book (bid/ask) from a Binance
    `bookTicker` WebSocket stream or a KuCoin level-1 REST poll.
@@ -31,10 +31,45 @@ configured trade size:
    `extra_buffer_bps`. The model assumes inventory pre-positioned on both
    venues (the standard arb setup); bridge/withdrawal rebalancing costs are
    out of scope. Quote tokens (USDT/USDC) are treated as $1.
-4. **Record** — append every observation to `data/<PAIR>.jsonl`. Samples taken
-   while the pool's estimated TVL is below `min_pool_tvl_usd` are still
-   recorded but flagged `include_in_stats: false` so thin-liquidity periods
-   don't pollute the profitability statistics.
+4. **Record** — append every observation to `data/<PAIR>.jsonl`. Each sample
+   carries independent leg timestamps (`cex_ts` = when the top-of-book was
+   received, `dex_ts` = when both DEX quotes completed) plus their skew;
+   samples are flagged `include_in_stats: false` (with an `exclude_reason`)
+   when the pool's estimated TVL is below `min_pool_tvl_usd` **or** the leg
+   skew exceeds `max_leg_skew` (default 3s) — recorded either way, so those
+   periods stay observable without polluting the profitability statistics.
+
+The point of the 2s cadence is not just "does net edge ever exceed zero" but
+**how long profitable windows last** — an edge lasting 900ms is uncapturable
+without colocation; the same edge lasting 30s might be tradeable. The report
+groups consecutive net-positive samples into windows and reports their
+duration distribution (see below).
+
+### RPC request budget
+
+Each sample costs **2 quote requests per trade size** (buy + sell leg), plus
+2 TVL requests per pair every `tvl_refresh_interval` (negligible). Per pair:
+
+```
+req/s  =  2 × len(trade_sizes_usd) / poll_interval_seconds
+```
+
+For the shipped config (3 sizes everywhere, 2s interval, SOL at 10s):
+
+| Endpoint | Pairs | req/s | req/min | ~req/month |
+|---|---|---|---|---|
+| ethereum RPC | ACX, GLM, FLUX | 9 | 540 | ~23M |
+| polygon RPC | POL | 3 | 180 | ~7.8M |
+| avalanche RPC | AVAX | 3 | 180 | ~7.8M |
+| Jupiter quote API | SOL | 0.6 | 36 | ~1.6M |
+
+Pick an RPC provider tier accordingly (the ethereum endpoint is the heavy
+one; free public endpoints generally will not sustain 540 req/min — use a
+provider plan sized for ~25M requests/month, or raise the ethereum pairs'
+`poll_interval` to 4–6s to halve/third it). `rate_limit_rps` is the hard
+cap: one shared limiter per endpoint paces and interleaves all pairs on it,
+so a misconfigured interval degrades into queueing (growing leg skew, which
+the skew gate then excludes) rather than into RPC bans.
 
 ### Supported venues
 
@@ -70,8 +105,12 @@ go run ./cmd/report -data data
 
 The report shows, per pair × trade size × direction: sample count, gross and
 net spread percentiles (p50/p95/max, in bps), and **`n>0` — the share of
-samples whose net edge exceeded break-even**, which is the question this tool
-exists to answer.
+samples whose net edge exceeded break-even** — followed by the
+**profitable-window analysis**: consecutive net-positive samples grouped into
+windows, with window count, duration percentiles (p50/p95/max seconds), and
+the edge-weighted mean duration (a long marginal window counts less than a
+short fat one). Window durations are upper bounds at the achieved sampling
+resolution, which the report prints per series (`res_s`).
 
 `-include-excluded` includes TVL-gated samples in the distributions.
 

@@ -159,6 +159,46 @@ func TestTVLGateExcludes(t *testing.T) {
 	}
 }
 
+func TestSkewGateExcludes(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxLegSkew = config.Duration(3 * time.Second)
+	w, _ := NewJSONLWriter(cfg.DataDir)
+	defer w.Close()
+	pair := config.Pair{
+		Symbol: "SKW/USDT", Tier: "large",
+		CEX:           config.CexConfig{Venue: "binance", Symbol: "SKWUSDT"},
+		DEX:           config.DexConfig{Chain: "testchain", Venue: "uniswap_v3"},
+		TradeSizesUSD: []float64{1000},
+	}
+	// Book is 5s old: fresh enough for MaxBookAge (10s) but the DEX quote
+	// completes now, so the leg skew (~5s) breaches max_leg_skew (3s).
+	r := &PairRunner{
+		Pair:   pair,
+		Feed:   &fakeFeed{book: cex.Book{Bid: 99.9, Ask: 100.1, Ts: time.Now().Add(-5 * time.Second)}},
+		Quoter: &fakeQuoter{price: 99.0, skew: 0.0005, tvl: 500000},
+	}
+	New(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), w, []*PairRunner{r})
+	r.sampleOnce(context.Background())
+
+	samples := readSamples(t, cfg.DataDir, "SKW-USDT.jsonl")
+	if len(samples) != 1 {
+		t.Fatalf("samples = %d, want 1 (recorded despite skew)", len(samples))
+	}
+	s := samples[0]
+	if s.IncludeInStats {
+		t.Error("sample with 5s leg skew must be excluded from stats")
+	}
+	if s.ExcludeReason != "skew" {
+		t.Errorf("exclude_reason = %q, want \"skew\"", s.ExcludeReason)
+	}
+	if s.SkewMs < 4500 {
+		t.Errorf("skew_ms = %d, want ~5000", s.SkewMs)
+	}
+	if s.CexTs.IsZero() || s.DexTs.IsZero() || !s.DexTs.After(s.CexTs) {
+		t.Errorf("leg timestamps not recorded: cex_ts=%v dex_ts=%v", s.CexTs, s.DexTs)
+	}
+}
+
 func TestStaleBookSkipsSample(t *testing.T) {
 	cfg := testConfig(t)
 	w, _ := NewJSONLWriter(cfg.DataDir)

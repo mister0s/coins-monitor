@@ -32,8 +32,25 @@ func TestLoadShippedConfig(t *testing.T) {
 	if p := byName["GLM/USDT"]; len(p.DEX.Route) != 1 || p.DEX.Route[0].FeeTier != 500 {
 		t.Errorf("GLM route = %+v", p.DEX.Route)
 	}
-	if cfg.PollInterval.Std() != 15*time.Second {
+	if cfg.PollInterval.Std() != 2*time.Second {
 		t.Errorf("poll interval = %v", cfg.PollInterval.Std())
+	}
+	if cfg.MaxLegSkew.Std() != 3*time.Second {
+		t.Errorf("max_leg_skew = %v", cfg.MaxLegSkew.Std())
+	}
+	// SOL overrides its interval for the Jupiter free-tier budget; the EVM
+	// pairs inherit the global one.
+	if p := byName["SOL/USDT"]; p.EffectiveInterval(cfg.PollInterval).Std() != 10*time.Second {
+		t.Errorf("SOL poll interval = %v", p.EffectiveInterval(cfg.PollInterval).Std())
+	}
+	if p := byName["AVAX/USDT"]; p.EffectiveInterval(cfg.PollInterval).Std() != 2*time.Second {
+		t.Errorf("AVAX poll interval = %v", p.EffectiveInterval(cfg.PollInterval).Std())
+	}
+	if got := cfg.RateLimitFor("solana"); got != 1 {
+		t.Errorf("solana rate limit = %v, want 1", got)
+	}
+	if got := cfg.RateLimitFor("unknown-chain"); got != DefaultRateLimitRPS {
+		t.Errorf("default rate limit = %v", got)
 	}
 }
 

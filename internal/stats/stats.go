@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mister0s/coins-monitor/internal/engine"
 )
@@ -26,12 +27,14 @@ type Key struct {
 
 type Agg struct {
 	Key      Key
+	Ts       []time.Time // parallel to Gross/Net; not necessarily sorted
 	Gross    []float64
 	Net      []float64
-	Excluded int // samples dropped by the TVL gate
+	Excluded int // samples dropped by a quality gate (TVL / leg skew)
 }
 
-func (a *Agg) add(gross, net float64) {
+func (a *Agg) add(ts time.Time, gross, net float64) {
+	a.Ts = append(a.Ts, ts)
 	a.Gross = append(a.Gross, gross)
 	a.Net = append(a.Net, net)
 }
@@ -98,7 +101,7 @@ func record(aggs map[Key]*Agg, s engine.Sample, includeExcluded bool) {
 			a.Excluded++
 			continue
 		}
-		a.add(d.gross, d.net)
+		a.add(s.Ts, d.gross, d.net)
 	}
 }
 
@@ -118,25 +121,7 @@ func percentile(sorted []float64, p float64) float64 {
 
 // Report renders a plain-text summary table grouped by tier.
 func Report(w io.Writer, aggs map[Key]*Agg) {
-	keys := make([]Key, 0, len(aggs))
-	for k := range aggs {
-		keys = append(keys, k)
-	}
-	tierRank := map[string]int{"large": 0, "mid": 1, "small": 2}
-	sort.Slice(keys, func(i, j int) bool {
-		a, b := keys[i], keys[j]
-		if tierRank[a.Tier] != tierRank[b.Tier] {
-			return tierRank[a.Tier] < tierRank[b.Tier]
-		}
-		if a.Symbol != b.Symbol {
-			return a.Symbol < b.Symbol
-		}
-		if a.SizeUSD != b.SizeUSD {
-			return a.SizeUSD < b.SizeUSD
-		}
-		return a.Direction < b.Direction
-	})
-
+	keys := sortedKeys(aggs)
 	currentTier := "\x00"
 	fmt.Fprintf(w, "%-10s %-9s %-18s %6s | %8s %8s %8s | %8s %8s %8s | %6s %8s\n",
 		"pair", "size_usd", "direction", "n",

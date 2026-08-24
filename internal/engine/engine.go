@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,9 +23,10 @@ type PairRunner struct {
 	Feed   cex.Feed
 	Quoter dex.Quoter
 
-	cfg *config.Config
-	log *slog.Logger
-	w   *JSONLWriter
+	cfg     *config.Config
+	log     *slog.Logger
+	w       *JSONLWriter
+	stagger time.Duration // initial offset so pairs on one endpoint interleave
 
 	mu          sync.Mutex
 	tvlUSD      float64 // -1 = unsupported/unknown
@@ -42,11 +44,26 @@ type Engine struct {
 }
 
 func New(cfg *config.Config, log *slog.Logger, w *JSONLWriter, runners []*PairRunner) *Engine {
+	// Spread the start of pairs that share a chain endpoint across the
+	// sampling interval, so their bursts interleave instead of colliding.
+	// The shared per-chain rate limiter is the hard cap; this just smooths.
+	perChainIdx := map[string]int{}
+	perChainTotal := map[string]int{}
+	for _, r := range runners {
+		perChainTotal[r.Pair.DEX.Chain]++
+	}
 	for _, r := range runners {
 		r.cfg = cfg
 		r.log = log.With("pair", r.Pair.Symbol)
 		r.w = w
 		r.tvlUSD = -1
+		chain := r.Pair.DEX.Chain
+		n := perChainTotal[chain]
+		if n > 1 {
+			interval := r.Pair.EffectiveInterval(cfg.PollInterval).Std()
+			r.stagger = time.Duration(perChainIdx[chain]) * interval / time.Duration(n)
+		}
+		perChainIdx[chain]++
 	}
 	return &Engine{cfg: cfg, log: log, w: w, runners: runners}
 }
@@ -98,7 +115,15 @@ func (e *Engine) summaryLoop(ctx context.Context) {
 }
 
 func (r *PairRunner) run(ctx context.Context) {
-	t := time.NewTicker(r.cfg.PollInterval.Std())
+	if r.stagger > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(r.stagger):
+		}
+	}
+	interval := r.Pair.EffectiveInterval(r.cfg.PollInterval).Std()
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		r.sampleOnce(ctx)
@@ -111,36 +136,35 @@ func (r *PairRunner) run(ctx context.Context) {
 }
 
 func (r *PairRunner) sampleOnce(ctx context.Context) {
-	book, ok := r.Feed.Book(r.Pair.CEX.Symbol)
+	// A first book read seeds the TVL refresh and sanity checks; each trade
+	// size then re-reads the cached book right before quoting to keep the
+	// CEX leg as fresh as possible.
+	book, ok := r.freshBook()
 	if !ok {
-		r.log.Debug("no CEX book yet")
 		return
 	}
-	if age := time.Since(book.Ts); age > r.cfg.MaxBookAge.Std() {
-		r.log.Warn("CEX book stale; skipping sample", "age", age.Round(time.Millisecond))
-		return
-	}
-	mid := book.Mid()
-	if mid <= 0 || book.Bid > book.Ask*1.5 {
-		r.log.Warn("implausible CEX book; skipping", "bid", book.Bid, "ask", book.Ask)
-		return
-	}
-
-	r.refreshTVL(ctx, mid)
+	r.refreshTVL(ctx, book.Mid())
 	r.mu.Lock()
 	tvl := r.tvlUSD
 	r.mu.Unlock()
-	includeInStats := tvl < 0 || r.Pair.MinPoolTVLUSD <= 0 || tvl >= r.Pair.MinPoolTVLUSD
+	tvlOK := tvl < 0 || r.Pair.MinPoolTVLUSD <= 0 || tvl >= r.Pair.MinPoolTVLUSD
 
 	gasUSD := r.cfg.Costs.GasUSD[r.Pair.DEX.Chain]
 	bestNet := 0.0
 	haveBest := false
 
 	for _, size := range r.Pair.TradeSizesUSD {
+		book, ok := r.freshBook()
+		if !ok {
+			return
+		}
+		mid := book.Mid()
+
 		qctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		baseOut, errBuy := r.Quoter.QuoteBuyBase(qctx, size)
 		quoteOut, errSell := r.Quoter.QuoteSellBase(qctx, size/mid)
 		cancel()
+		dexTs := time.Now()
 		if ctx.Err() != nil {
 			return
 		}
@@ -151,14 +175,32 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 		if baseOut <= 0 || quoteOut <= 0 {
 			continue
 		}
+
+		skew := dexTs.Sub(book.Ts)
+		if skew < 0 {
+			skew = -skew
+		}
+		maxSkew := r.cfg.MaxLegSkew.Std()
+		skewOK := maxSkew <= 0 || skew <= maxSkew
+		var reasons []string
+		if !tvlOK {
+			reasons = append(reasons, "tvl")
+		}
+		if !skewOK {
+			reasons = append(reasons, "skew")
+		}
+
 		s := Sample{
-			Ts:             time.Now().UTC(),
+			Ts:             dexTs.UTC(),
 			Symbol:         r.Pair.Symbol,
 			Tier:           r.Pair.Tier,
 			CexVenue:       r.Feed.Venue(),
 			DexVenue:       r.Quoter.Venue(),
 			Chain:          r.Pair.DEX.Chain,
 			TradeSizeUSD:   size,
+			CexTs:          book.Ts.UTC(),
+			DexTs:          dexTs.UTC(),
+			SkewMs:         skew.Milliseconds(),
 			CexBid:         book.Bid,
 			CexAsk:         book.Ask,
 			CexMid:         mid,
@@ -169,7 +211,8 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 			BufferBps:      r.cfg.Costs.ExtraBufferBps,
 			PoolTVLUSD:     tvl,
 			MinPoolTVLUSD:  r.Pair.MinPoolTVLUSD,
-			IncludeInStats: includeInStats,
+			IncludeInStats: len(reasons) == 0,
+			ExcludeReason:  strings.Join(reasons, "+"),
 		}
 		s.computeEdges()
 		if err := r.w.Write(s); err != nil {
@@ -182,15 +225,14 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 		if !haveBest || net > bestNet {
 			bestNet, haveBest = net, true
 		}
-		if net > 0 {
+		if net > 0 && s.IncludeInStats {
 			dir := "buy_dex_sell_cex"
 			if s.NetBuyCexSellDexBps > s.NetBuyDexSellCexBps {
 				dir = "buy_cex_sell_dex"
 			}
 			r.log.Info("POSITIVE net edge observed",
 				"size_usd", size, "direction", dir,
-				"net_bps", fmt.Sprintf("%.1f", net),
-				"included_in_stats", includeInStats)
+				"net_bps", fmt.Sprintf("%.1f", net))
 		}
 	}
 	if haveBest {
@@ -199,6 +241,24 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 		r.lastSample = time.Now()
 		r.mu.Unlock()
 	}
+}
+
+// freshBook returns the current cached top-of-book if it is usable.
+func (r *PairRunner) freshBook() (cex.Book, bool) {
+	book, ok := r.Feed.Book(r.Pair.CEX.Symbol)
+	if !ok {
+		r.log.Debug("no CEX book yet")
+		return cex.Book{}, false
+	}
+	if age := time.Since(book.Ts); age > r.cfg.MaxBookAge.Std() {
+		r.log.Warn("CEX book stale; skipping sample", "age", age.Round(time.Millisecond))
+		return cex.Book{}, false
+	}
+	if book.Mid() <= 0 || book.Bid > book.Ask*1.5 {
+		r.log.Warn("implausible CEX book; skipping", "bid", book.Bid, "ask", book.Ask)
+		return cex.Book{}, false
+	}
+	return book, true
 }
 
 func (r *PairRunner) refreshTVL(ctx context.Context, basePriceUSD float64) {

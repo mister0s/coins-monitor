@@ -6,11 +6,24 @@
 #
 # Values like ${SOME_ENV} are expanded from the environment at load time.
 
-poll_interval: 15s        # spread sampling cadence per pair
+poll_interval: 2s         # spread sampling cadence per pair (per-pair override below)
 tvl_refresh_interval: 10m # how often pool TVL is re-estimated
 summary_interval: 60s     # console summary cadence
 max_book_age: 10s         # reject CEX top-of-book older than this
+max_leg_skew: 3s          # samples with |dex_ts - cex_ts| above this are
+                          # recorded but excluded from profitability stats
 data_dir: data            # JSONL sample output directory
+
+# Outbound request caps per endpoint, requests/second. One shared limiter per
+# endpoint paces ALL pairs using it (quotes + TVL), so a burst of pairs can't
+# blow through a free-tier RPC limit. See README "RPC request budget" for the
+# per-endpoint request math for this config.
+rate_limit_rps:
+  ethereum: 10
+  polygon: 10
+  avalanche: 10
+  optimism: 10
+  solana: 1 # Jupiter lite-api free tier is roughly 1 req/s
 
 # Read-only JSON-RPC endpoints per chain. The public defaults below work for
 # light polling; replace with your own provider for reliability, e.g.:
@@ -68,6 +81,9 @@ pairs:
       # quote_url: "https://lite-api.jup.ag/swap/v1/quote"  # default; needs no key
     trade_sizes_usd: [1000, 5000, 20000]
     min_pool_tvl_usd: 0 # aggregator quote — no single pool to gate on
+    # 6 quotes per sample against a ~1 req/s free tier: sample slower than
+    # the EVM pairs. Drop this override if you have a paid Jupiter API key.
+    poll_interval: 10s
 
   - symbol: POL/USDT
     tier: large

@@ -86,6 +86,17 @@ type Pair struct {
 	DEX           DexConfig `yaml:"dex"`
 	TradeSizesUSD []float64 `yaml:"trade_sizes_usd"`
 	MinPoolTVLUSD float64   `yaml:"min_pool_tvl_usd"`
+	// PollInterval overrides the global poll_interval for this pair (e.g. to
+	// slow down a pair on a rate-limited endpoint).
+	PollInterval Duration `yaml:"poll_interval"`
+}
+
+// EffectiveInterval returns this pair's sampling interval.
+func (p Pair) EffectiveInterval(global Duration) Duration {
+	if p.PollInterval > 0 {
+		return p.PollInterval
+	}
+	return global
 }
 
 func (p Pair) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
@@ -99,14 +110,32 @@ func (p Pair) BaseSymbol() string {
 }
 
 type Config struct {
-	PollInterval       Duration          `yaml:"poll_interval"`
-	TVLRefreshInterval Duration          `yaml:"tvl_refresh_interval"`
-	SummaryInterval    Duration          `yaml:"summary_interval"`
-	MaxBookAge         Duration          `yaml:"max_book_age"` // reject CEX quotes older than this
-	DataDir            string            `yaml:"data_dir"`
-	Chains             map[string]string `yaml:"chains"` // chain -> JSON-RPC URL (supports ${ENV} expansion)
-	Costs              Costs             `yaml:"costs"`
-	Pairs              []Pair            `yaml:"pairs"`
+	PollInterval       Duration `yaml:"poll_interval"`
+	TVLRefreshInterval Duration `yaml:"tvl_refresh_interval"`
+	SummaryInterval    Duration `yaml:"summary_interval"`
+	MaxBookAge         Duration `yaml:"max_book_age"` // reject CEX quotes older than this
+	// MaxLegSkew is the maximum |dex_ts - cex_ts| for a sample to count in
+	// profitability stats; larger-skew samples are recorded but excluded.
+	MaxLegSkew Duration          `yaml:"max_leg_skew"`
+	DataDir    string            `yaml:"data_dir"`
+	Chains     map[string]string `yaml:"chains"` // chain -> JSON-RPC URL (supports ${ENV} expansion)
+	// RateLimitRPS caps outbound quote/TVL requests per endpoint, keyed by
+	// chain name ("solana" covers the Jupiter quote API). One shared limiter
+	// per endpoint paces and staggers all pairs using it. 0/absent = default.
+	RateLimitRPS map[string]float64 `yaml:"rate_limit_rps"`
+	Costs        Costs              `yaml:"costs"`
+	Pairs        []Pair             `yaml:"pairs"`
+}
+
+// DefaultRateLimitRPS applies when rate_limit_rps has no entry for a chain.
+const DefaultRateLimitRPS = 10.0
+
+// RateLimitFor returns the configured RPS cap for an endpoint key.
+func (c *Config) RateLimitFor(chain string) float64 {
+	if v, ok := c.RateLimitRPS[chain]; ok {
+		return v
+	}
+	return DefaultRateLimitRPS
 }
 
 // Load reads, env-expands, parses and validates the config file.
@@ -133,7 +162,10 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) applyDefaults() {
 	if c.PollInterval == 0 {
-		c.PollInterval = Duration(15 * time.Second)
+		c.PollInterval = Duration(2 * time.Second)
+	}
+	if c.MaxLegSkew == 0 {
+		c.MaxLegSkew = Duration(3 * time.Second)
 	}
 	if c.TVLRefreshInterval == 0 {
 		c.TVLRefreshInterval = Duration(10 * time.Minute)

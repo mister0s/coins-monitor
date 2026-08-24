@@ -22,6 +22,14 @@ type Sample struct {
 	Chain        string    `json:"chain"`
 	TradeSizeUSD float64   `json:"trade_size_usd"`
 
+	// Leg timestamps: CexTs is when the CEX top-of-book was received, DexTs
+	// is when both DEX quotes completed. SkewMs = DexTs - CexTs; a spread
+	// computed across a large skew compares prices from different moments,
+	// so samples with |skew| > max_leg_skew are excluded from stats.
+	CexTs  time.Time `json:"cex_ts"`
+	DexTs  time.Time `json:"dex_ts"`
+	SkewMs int64     `json:"skew_ms"`
+
 	CexBid float64 `json:"cex_bid"`
 	CexAsk float64 `json:"cex_ask"`
 	CexMid float64 `json:"cex_mid"`
@@ -43,9 +51,11 @@ type Sample struct {
 	// TVL gate. PoolTVLUSD is -1 when the venue cannot report TVL.
 	PoolTVLUSD    float64 `json:"pool_tvl_usd"`
 	MinPoolTVLUSD float64 `json:"min_pool_tvl_usd"`
-	// IncludeInStats is false when the pool fails the TVL gate; the sample is
-	// still recorded so thin-liquidity periods remain observable.
-	IncludeInStats bool `json:"include_in_stats"`
+	// IncludeInStats is false when the sample fails a quality gate (TVL or
+	// leg skew); it is still recorded so those periods remain observable.
+	// ExcludeReason names the gate(s) that failed: "tvl", "skew", "tvl+skew".
+	IncludeInStats bool   `json:"include_in_stats"`
+	ExcludeReason  string `json:"exclude_reason,omitempty"`
 }
 
 // costBps converts the per-trade fixed costs into basis points of the trade size.

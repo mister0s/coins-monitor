@@ -18,6 +18,7 @@ import (
 	"github.com/mister0s/coins-monitor/internal/dex"
 	"github.com/mister0s/coins-monitor/internal/engine"
 	"github.com/mister0s/coins-monitor/internal/evm"
+	"github.com/mister0s/coins-monitor/internal/ratelimit"
 )
 
 func main() {
@@ -46,6 +47,19 @@ func run(configPath string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// One rate limiter per endpoint key (chain name; "solana" covers the
+	// Jupiter quote API): every pair on the endpoint shares it, which caps
+	// the request rate and interleaves concurrent pollers.
+	limiters := map[string]*ratelimit.Limiter{}
+	limiterFor := func(key string) *ratelimit.Limiter {
+		if l, ok := limiters[key]; ok {
+			return l
+		}
+		l := ratelimit.New(cfg.RateLimitFor(key))
+		limiters[key] = l
+		return l
+	}
+
 	clients := map[string]*evm.Client{} // chain -> client
 	clientFor := func(chain string) (*evm.Client, error) {
 		if c, ok := clients[chain]; ok {
@@ -55,7 +69,7 @@ func run(configPath string, log *slog.Logger) error {
 		if !ok || rpcURL == "" {
 			return nil, fmt.Errorf("no RPC URL configured for chain %q (set chains.%s, env-expandable)", chain, chain)
 		}
-		c := evm.NewClient(rpcURL)
+		c := evm.NewClient(rpcURL, limiterFor(chain))
 		clients[chain] = c
 		return c, nil
 	}
@@ -72,7 +86,7 @@ func run(configPath string, log *slog.Logger) error {
 			log.Info("pair disabled in config; skipping", "pair", p.Symbol)
 			continue
 		}
-		q, err := buildQuoter(ctx, p, clientFor)
+		q, err := buildQuoter(ctx, p, clientFor, limiterFor)
 		if err != nil {
 			log.Warn("pair skipped: DEX side not usable", "pair", p.Symbol, "err", err)
 			continue
@@ -177,10 +191,10 @@ func probeFeed(p config.Pair, cfg *config.Config, log *slog.Logger) (cex.Feed, e
 	}
 }
 
-func buildQuoter(ctx context.Context, p config.Pair, clientFor func(string) (*evm.Client, error)) (dex.Quoter, error) {
+func buildQuoter(ctx context.Context, p config.Pair, clientFor func(string) (*evm.Client, error), limiterFor func(string) *ratelimit.Limiter) (dex.Quoter, error) {
 	d := p.DEX
 	if d.Venue == "jupiter" {
-		return dex.NewJupiter(d.QuoteURL, d.BaseMint, d.BaseToken.Decimals, d.QuoteMint, d.QuoteToken.Decimals)
+		return dex.NewJupiter(d.QuoteURL, d.BaseMint, d.BaseToken.Decimals, d.QuoteMint, d.QuoteToken.Decimals, limiterFor(d.Chain))
 	}
 
 	client, err := clientFor(d.Chain)
