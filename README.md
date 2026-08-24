@@ -54,7 +54,8 @@ wrong fee tier, missing route). One broken pair never stops the others.
 
 ## Quick start
 
-Requires Go 1.22+.
+Requires Go 1.24+ (build with a currently supported Go patch release — the
+standard library carries most of the security surface here).
 
 ```sh
 # 1. Review config.yaml: fill in the REPLACE_ME pool addresses (see comments)
