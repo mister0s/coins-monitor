@@ -44,11 +44,14 @@ pairs:
     dex:
       chain: avalanche
       venue: lfj
-      # LFJ (Trader Joe) Liquidity Book AVAX/USDT pair on the C-Chain.
-      # Find the current LBPair address at https://lfj.gg (pool page → contract).
-      pool_address: "REPLACE_ME_LB_PAIR_ADDRESS"
+      # LFJ's deep AVAX stable pool is WAVAX/USDC (LB v2.2, ~$4.5M):
+      # the native WAVAX/USDt LB pair only holds ~$100k, so we quote the DEX
+      # side in USDC and treat USDC == USDT == $1 (documented model
+      # assumption). Thin native-USDt alternative:
+      #   0x87eb2f90d7d0034571f343fb7429ae22c1bd9f72 (quote 0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7, USDt)
+      pool_address: "0x864d4e5ee7318e97483db7eb0912e09f161516ea"
       base_token: { address: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7" }  # WAVAX
-      quote_token: { address: "0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7" } # USDt
+      quote_token: { address: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E" } # USDC (native)
     trade_sizes_usd: [1000, 5000, 20000]
     min_pool_tvl_usd: 200000
 
@@ -72,9 +75,8 @@ pairs:
     dex:
       chain: polygon
       venue: uniswap_v3
-      fee_tier: 500 # WPOL/USDT 0.05%; verify at https://app.uniswap.org/explore/pools/polygon
-      # pool_address enables the TVL gate; quoting works without it.
-      pool_address: ""
+      fee_tier: 500 # WPOL/USDT 0.05% (~$1M TVL)
+      pool_address: "0x9b08288c3be4f62bbf8d1c20ac9c5e6f9467d8b7"
       base_token: { address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270" }  # WPOL (ex-WMATIC)
       quote_token: { address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F" } # USDT (PoS)
     trade_sizes_usd: [1000, 5000, 20000]
@@ -91,18 +93,19 @@ pairs:
     dex:
       chain: ethereum
       venue: uniswap_v3
-      # Verify the canonical FLUX ERC-20 address and its deepest pool/fee tier
-      # before enabling (FLUX is natively its own chain; only a bridged ERC-20
-      # trades on Uniswap). https://app.uniswap.org/explore/tokens/ethereum
-      pool_address: ""
-      fee_tier: 3000
-      route: # USDT -> WETH (0.05%) -> FLUX (fee_tier above)
+      # FLUX/WETH 1% pool. VERY thin (~$55k, a handful of trades/day): the
+      # TVL gate will exclude these samples from profitability stats, which
+      # is exactly what tier-2 monitoring is for. For routed pairs the TVL
+      # estimate only counts the base-token side of this pool (its USDT
+      # balance is ~0), so it understates roughly 2x.
+      pool_address: "0x07aa6584385cca15c2c6e13a5599ffc2d177e33b"
+      fee_tier: 10000
+      route: # USDT -> WETH (0.05%) -> FLUX (1%)
         - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", fee_tier: 500 }
-      base_token: { address: "REPLACE_ME_FLUX_ERC20_ADDRESS" }
+      base_token: { address: "0x720cd16b011b987da3518fbf38c3071d4f0d1495" } # FLUX (bridged ERC-20)
       quote_token: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" } # USDT
     trade_sizes_usd: [100, 500, 1000]
     min_pool_tvl_usd: 200000
-    enabled: false # enable after filling in the FLUX ERC-20 address
 
   - symbol: ACX/USDT
     tier: small
@@ -110,11 +113,11 @@ pairs:
     dex:
       chain: ethereum
       venue: uniswap_v3
-      # ACX's main Uniswap liquidity is vs WETH, so route via WETH.
-      # Verify the final-leg fee tier (0.3% vs 1%) on the Uniswap explorer.
-      pool_address: ""
-      fee_tier: 3000
-      route: # USDT -> WETH (0.05%) -> ACX (fee_tier above)
+      # ACX's main Uniswap liquidity is the ACX/WETH 1% pool (~$1M), so
+      # route via WETH. Routed-pair TVL counts only the ACX side (~2x under).
+      pool_address: "0x508acdc358be2ed126b1441f0cff853dec49d40f"
+      fee_tier: 10000
+      route: # USDT -> WETH (0.05%) -> ACX (1%)
         - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", fee_tier: 500 }
       base_token: { address: "0x44108f0223A3C3028F5Fe7AEC7f9bb2E66beF82F" }  # ACX
       quote_token: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" } # USDT
@@ -134,7 +137,8 @@ pairs:
     dex:
       chain: optimism
       venue: velodrome # vAMM v2 pools only (Slipstream CL pools unsupported)
-      pool_address: "REPLACE_ME_VELODROME_VAMM_POOL"
+      # VELO/USDC.e v2 pool (~$90k — thin even if the ticker issue is resolved)
+      pool_address: "0x8134a2fdc127549480865fb8e5a9e8a8a95a54c5"
       base_token: { address: "0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db" }  # VELO v2 (Velodrome)
       quote_token: { address: "0x7F5c764cBc14f9669B88837ca1490cCa17c31607" } # USDC.e
     trade_sizes_usd: [100, 500, 1000]
@@ -146,10 +150,13 @@ pairs:
     dex:
       chain: ethereum
       venue: uniswap_v3
-      # GLM's main Uniswap liquidity is vs WETH, so route via WETH.
-      pool_address: ""
-      fee_tier: 3000
-      route: # USDT -> WETH (0.05%) -> GLM (fee_tier above)
+      # GLM/WETH 1% v3 pool — thin (~$55k): most GLM DEX liquidity sits in
+      # the Uniswap v2 GLM/WETH pool, and v2 is not a supported venue here,
+      # so expect the TVL gate to exclude these samples (routed-pair TVL
+      # counts only the GLM side, ~2x under).
+      pool_address: "0x531b6a4b3f962208ea8ed5268c642c84bb29be0b"
+      fee_tier: 10000
+      route: # USDT -> WETH (0.05%) -> GLM (1%)
         - { token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", fee_tier: 500 }
       base_token: { address: "0x7DD9c5Cba05E151C895FDe1CF355C9A1D5DA6429" }  # GLM
       quote_token: { address: "0xdAC17F958D2ee523a2206206994597C13D831ec7" } # USDT

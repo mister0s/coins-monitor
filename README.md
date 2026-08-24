@@ -80,16 +80,18 @@ exists to answer.
 See the extensively commented [`config.yaml`](config.yaml). Adding a pair is
 appending one YAML block. Notes on the shipped pairs:
 
-- **AVAX/USDT (LFJ)** — fill in the current LB pair address from lfj.gg
-  before it activates.
+- **AVAX/USDT (LFJ)** — points at the deep WAVAX/USDC LB v2.2 pool (~$4.5M);
+  the native WAVAX/USDt LB pair only holds ~$100k and is left as a commented
+  alternative. USDC is treated as $1, same as USDT.
 - **SOL/USDT (Jupiter)** — works out of the box via the free
   `lite-api.jup.ag` endpoint; there is no single pool, so no TVL gate.
-- **POL/USDT, GLM/USDT, ACX/USDT (Uniswap v3)** — quote via QuoterV2, so a
-  pool address is only needed if you want the TVL gate. GLM and ACX route
-  through WETH (their USDT liquidity is negligible); verify the final-leg fee
-  tier on the Uniswap explorer.
-- **FLUX/USDT** — ships disabled: verify the canonical bridged FLUX ERC-20
-  address first (FLUX is natively its own chain).
+- **POL/USDT (Uniswap v3)** — WPOL/USDT 0.05% pool on Polygon (~$1M).
+- **ACX/USDT, GLM/USDT, FLUX/USDT (Uniswap v3)** — routed USDT→WETH→token;
+  the deepest pools are all the 1% fee tier vs WETH. ACX is reasonably deep
+  (~$1M); GLM and FLUX v3 pools are very thin (~$55k each — most GLM DEX
+  liquidity is in Uniswap v2, which isn't a supported venue), so expect the
+  TVL gate to exclude their samples. For routed pairs the TVL estimate
+  counts only the base-token side of the final pool (~2x understated).
 - **VELO/USDT** — ships disabled deliberately: the "VELO" listed on
   Binance/KuCoin is **Velo Labs**, a different asset from Velodrome
   Finance's VELO on Optimism. Enabling it as-is would compare two unrelated
