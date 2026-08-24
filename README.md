@@ -10,6 +10,43 @@ keys, and no wallet integration of any kind. It reads public market data
 (CEX WebSocket/REST endpoints) and performs read-only `eth_call` /
 aggregator-quote requests. It cannot trade.
 
+## Data integrity
+
+**There is no synthetic, demo, or fallback market data anywhere in the
+runtime.** Every recorded number originates from a live network response;
+mock data exists only inside `_test.go` files, which are never compiled
+into the binaries. The pipeline is fail-loud by design:
+
+- If a websocket disconnects, an RPC call fails, or a book goes stale, the
+  sampler records **nothing** for that pair and logs the error. Zero
+  samples is a valid, visible outcome; invented samples are not. There are
+  no default prices and no retry-with-substitute paths.
+- If a pair's configured `quote_basis_symbol` book is unavailable, the
+  canonical corrected edge cannot be computed — the sample is recorded
+  (raw truth only) but flagged `exclude_reason: basis`, never silently
+  passed off as corrected.
+- **Provenance on every sample**: `cex_source` (feed endpoint URL),
+  `cex_conn_id` (the websocket connection instance that delivered the
+  book, incremented on every reconnect), `cex_ts` (local receive time),
+  and `dex_source` (the RPC / quote-API endpoint that answered).
+- **Startup self-test**: on boot the monitor fetches one live quote per
+  venue leg (CEX top-of-book over REST — a transport independent of the
+  websocket — the basis book, and a DEX probe quote) and prints each with
+  its timestamp. Failures are reported explicitly as `SELF-TEST FAILED`
+  lines; the monitor never proceeds quietly past a dead venue.
+- **`cmd/verify`**: cross-checks recent stored samples against Binance
+  REST klines for the same interval (`go run ./cmd/verify -lookback 1h`).
+  Each checked sample's recorded mid must lie inside the venue's
+  [low, high] for that moment; deviations are reported in bps and the
+  exit code is non-zero beyond `-max-dev-bps`. WS and REST are separate
+  transports, so agreement is meaningful evidence the recording pipeline
+  reflects reality.
+
+Any example output in docs or discussions that predates real collection
+was synthetic format demonstration — trust only what `cmd/report` prints
+from your own `data/monitor.db`, and spot-check it with `cmd/verify` and
+`cmd/spotcheck`.
+
 ## How it works
 
 Every `poll_interval` (default 2s, per-pair overridable), for each configured

@@ -54,6 +54,8 @@ func NewJupiter(quoteURL, baseMint string, baseDecimals int, quoteMint string, q
 
 func (j *Jupiter) Venue() string { return "jupiter" }
 
+func (j *Jupiter) Source() string { return j.quoteURL }
+
 type jupiterQuote struct {
 	OutAmount string `json:"outAmount"`
 	Error     string `json:"error"`

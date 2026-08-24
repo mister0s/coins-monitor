@@ -120,6 +120,8 @@ func NewUniswapV2(ctx context.Context, client *evm.Client, router, pool, baseTok
 
 func (u *UniswapV2) Venue() string { return "uniswap_v2" }
 
+func (u *UniswapV2) Source() string { return u.client.URL() }
+
 func (u *UniswapV2) path(buyingBase bool) []string {
 	p := append([]string{u.quoteToken}, u.route...)
 	p = append(p, u.baseToken)

@@ -17,7 +17,9 @@ func sample(ts time.Time, symbol string, size float64) engine.Sample {
 		Ts: ts, Symbol: symbol, Tier: "small", CexVenue: "binance", DexVenue: "uniswap_v2",
 		Chain: "ethereum", TradeSizeUSD: size,
 		CexTs: ts.Add(-200 * time.Millisecond), DexTs: ts, SkewMs: 200,
-		CexBid: 1.001, CexAsk: 1.002, CexMid: 1.0015,
+		CexSource: "wss://stream.binance.com:9443", CexConnID: "binance-ws-3",
+		DexSource: "https://rpc.example.test",
+		CexBid:    1.001, CexAsk: 1.002, CexMid: 1.0015,
 		DexBuyPrice: 1.0, DexSellPrice: 0.999,
 		GrossBuyDexSellCexBps: 10, NetBuyDexSellCexBps: -10,
 		GrossBuyCexSellDexBps: -30, NetBuyCexSellDexBps: -50,
@@ -63,6 +65,9 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		t.Fatalf("read %d samples", len(got))
 	}
 	g := got[0]
+	if g.CexSource != want.CexSource || g.CexConnID != want.CexConnID || g.DexSource != want.DexSource {
+		t.Errorf("provenance round trip: %q %q %q", g.CexSource, g.CexConnID, g.DexSource)
+	}
 	if !g.Ts.Equal(want.Ts) || g.Symbol != want.Symbol || g.NetBuyDexSellCexAdjBps != want.NetBuyDexSellCexAdjBps ||
 		g.BasisMid != want.BasisMid || g.MomentumBucket != want.MomentumBucket ||
 		g.MomentumThresholdBps != want.MomentumThresholdBps || !g.MomentumOK || !g.IncludeInStats ||

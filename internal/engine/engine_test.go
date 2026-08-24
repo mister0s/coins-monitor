@@ -13,13 +13,17 @@ import (
 )
 
 type fakeFeed struct {
-	book  cex.Book
-	books map[string]cex.Book // per-symbol overrides (e.g. a basis symbol)
+	book   cex.Book
+	books  map[string]cex.Book // per-symbol overrides (e.g. a basis symbol)
+	strict bool                // if set, symbols missing from books have no data
 }
 
 func (f *fakeFeed) Book(symbol string) (cex.Book, bool) {
 	if b, ok := f.books[symbol]; ok {
 		return b, true
+	}
+	if f.strict { // symbols outside the map do not exist
+		return cex.Book{}, false
 	}
 	return f.book, true
 }
@@ -44,7 +48,8 @@ func (q *fakeQuoter) QuoteSellBase(_ context.Context, baseIn float64) (float64, 
 func (q *fakeQuoter) PoolTVLUSD(context.Context, float64) (float64, error) {
 	return q.tvl, q.tvlErr
 }
-func (q *fakeQuoter) Venue() string { return "fake_dex" }
+func (q *fakeQuoter) Venue() string  { return "fake_dex" }
+func (q *fakeQuoter) Source() string { return "https://fake-rpc.test" }
 
 func testConfig(t *testing.T) *config.Config {
 	return &config.Config{
@@ -245,6 +250,52 @@ func TestQuoteBasisCorrection(t *testing.T) {
 	ref.computeEdges()
 	if ref.NetBuyDexSellCexBps != s.NetBuyDexSellCexBps {
 		t.Error("raw fields must not be altered by the correction")
+	}
+}
+
+func TestMissingBasisExcludesSample(t *testing.T) {
+	cfg := testConfig(t)
+	w := &fakeRecorder{}
+	// Basis symbol configured but its book never arrives: the canonical
+	// corrected edge cannot be computed, so the sample must be recorded but
+	// excluded — never silently recorded with adj == raw as if corrected.
+	pair := config.Pair{
+		Symbol: "NOB/USDT", Tier: "large",
+		CEX: config.CexConfig{Venue: "binance", Symbol: "NOBUSDT"},
+		DEX: config.DexConfig{
+			Chain: "testchain", Venue: "lfj",
+			QuoteBasisSymbol: "USDCUSDT",
+		},
+		TradeSizesUSD: []float64{1000},
+	}
+	r := &PairRunner{
+		Pair: pair,
+		Feed: &fakeFeed{
+			books:  map[string]cex.Book{"NOBUSDT": {Bid: 100.0, Ask: 100.1, Ts: time.Now(), Source: "wss://x", ConnID: "c1"}},
+			strict: true, // USDCUSDT missing
+		},
+		Quoter: &fakeQuoter{price: 99.0, skew: 0.0005, tvl: 500000},
+	}
+	New(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), w, []*PairRunner{r})
+	r.sampleOnce(context.Background())
+
+	if len(w.samples) != 1 {
+		t.Fatalf("samples = %d, want 1 (recorded, flagged)", len(w.samples))
+	}
+	s := w.samples[0]
+	if s.IncludeInStats {
+		t.Error("sample without its configured basis book must be excluded from stats")
+	}
+	if s.ExcludeReason != "basis" {
+		t.Errorf("exclude_reason = %q, want \"basis\"", s.ExcludeReason)
+	}
+	if s.BasisMid != 0 {
+		t.Errorf("basis_mid must be 0 (unavailable), got %v", s.BasisMid)
+	}
+	// Provenance recorded from the book and the quoter.
+	if s.CexSource != "wss://x" || s.CexConnID != "c1" || s.DexSource != "https://fake-rpc.test" {
+		t.Errorf("provenance missing: cex_source=%q conn=%q dex_source=%q",
+			s.CexSource, s.CexConnID, s.DexSource)
 	}
 }
 

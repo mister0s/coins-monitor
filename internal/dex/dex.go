@@ -27,4 +27,7 @@ type Quoter interface {
 	// Returns ErrTVLUnsupported where not applicable.
 	PoolTVLUSD(ctx context.Context, basePriceUSD float64) (float64, error)
 	Venue() string
+	// Source identifies the endpoint quotes physically come from (RPC or
+	// quote-API URL), recorded on every sample for provenance.
+	Source() string
 }

@@ -37,6 +37,9 @@ func NewClient(rpcURL string, limiter *ratelimit.Limiter) *Client {
 	}
 }
 
+// URL returns the RPC endpoint this client talks to.
+func (c *Client) URL() string { return c.url }
+
 type rpcRequest struct {
 	JSONRPC string        `json:"jsonrpc"`
 	ID      int64         `json:"id"`

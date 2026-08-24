@@ -8,18 +8,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
-	"encoding/json"
-
+	"github.com/mister0s/coins-monitor/internal/cex"
 	"github.com/mister0s/coins-monitor/internal/config"
 	"github.com/mister0s/coins-monitor/internal/engine"
 	"github.com/mister0s/coins-monitor/internal/store"
@@ -130,44 +126,16 @@ func resolveCex(configPath, pair string) (symbol, endpoint string) {
 }
 
 func printKlines(endpoint, symbol string, from, to time.Time) error {
-	q := url.Values{}
-	q.Set("symbol", symbol)
-	q.Set("interval", "1s")
-	q.Set("startTime", strconv.FormatInt(from.UnixMilli(), 10))
-	q.Set("endTime", strconv.FormatInt(to.UnixMilli(), 10))
-	q.Set("limit", "1000")
-	u := strings.TrimRight(endpoint, "/") + "/api/v3/klines?" + q.Encode()
-	hc := &http.Client{Timeout: 15 * time.Second}
-	resp, err := hc.Get(u)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	rows, err := cex.BinanceKlines(ctx, endpoint, symbol, "1s", from, to)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var rows [][]interface{}
-	if err := json.Unmarshal(body, &rows); err != nil {
-		return err
-	}
-	fmt.Printf("%-12s %10s %10s %10s %10s %12s\n", "open(utc)", "open", "high", "low", "close", "base_vol")
-	for _, r := range rows {
-		if len(r) < 6 {
-			continue
-		}
-		openMs, _ := r[0].(float64)
-		ts := time.UnixMilli(int64(openMs)).UTC()
-		fmt.Printf("%-12s %10s %10s %10s %10s %12s\n",
-			ts.Format("15:04:05"), str(r[1]), str(r[2]), str(r[3]), str(r[4]), str(r[5]))
+	fmt.Printf("%-12s %12s %12s %12s %12s %12s\n", "open(utc)", "open", "high", "low", "close", "base_vol")
+	for _, k := range rows {
+		fmt.Printf("%-12s %12.6f %12.6f %12.6f %12.6f %12.4f\n",
+			k.OpenTime.Format("15:04:05"), k.Open, k.High, k.Low, k.Close, k.Volume)
 	}
 	return nil
-}
-
-func str(v interface{}) string {
-	s, _ := v.(string)
-	return s
 }

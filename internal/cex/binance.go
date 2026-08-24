@@ -9,10 +9,43 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// SnapshotBinance fetches one live top-of-book over REST — used by the
+// startup self-test as a transport independent of the websocket.
+func SnapshotBinance(ctx context.Context, restEndpoint, symbol string) (Book, error) {
+	u := fmt.Sprintf("%s/api/v3/ticker/bookTicker?symbol=%s",
+		strings.TrimRight(restEndpoint, "/"), url.QueryEscape(strings.ToUpper(symbol)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return Book{}, err
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return Book{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return Book{}, fmt.Errorf("binance bookTicker HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Bid string `json:"bidPrice"`
+		Ask string `json:"askPrice"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return Book{}, err
+	}
+	bid, err1 := strconv.ParseFloat(out.Bid, 64)
+	ask, err2 := strconv.ParseFloat(out.Ask, 64)
+	if err1 != nil || err2 != nil || bid <= 0 || ask <= 0 {
+		return Book{}, fmt.Errorf("bad bookTicker for %s: bid=%q ask=%q", symbol, out.Bid, out.Ask)
+	}
+	return Book{Bid: bid, Ask: ask, Ts: time.Now(), Source: u, ConnID: "binance-rest"}, nil
+}
 
 // BinanceFeed streams bookTicker updates for a set of symbols over one
 // combined-stream WebSocket connection, reconnecting with backoff.
@@ -23,6 +56,7 @@ type BinanceFeed struct {
 	cache        *bookCache
 	log          *slog.Logger
 	hc           *http.Client
+	connSeq      atomic.Int64 // increments per (re)connect, for provenance
 }
 
 func NewBinanceFeed(wsEndpoint, restEndpoint string, symbols []string, log *slog.Logger) *BinanceFeed {
@@ -130,7 +164,8 @@ func (f *BinanceFeed) streamOnce(ctx context.Context) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
-	f.log.Info("websocket connected", "symbols", len(f.symbols))
+	connID := fmt.Sprintf("binance-ws-%d", f.connSeq.Add(1))
+	f.log.Info("websocket connected", "conn_id", connID, "symbols", len(f.symbols))
 
 	// Binance sends pings; gorilla's default handler pongs. Close on ctx cancel.
 	done := make(chan struct{})
@@ -160,6 +195,9 @@ func (f *BinanceFeed) streamOnce(ctx context.Context) error {
 		if err1 != nil || err2 != nil || bid <= 0 || ask <= 0 {
 			continue
 		}
-		f.cache.set(m.Data.Symbol, Book{Bid: bid, Ask: ask, Ts: time.Now()})
+		f.cache.set(m.Data.Symbol, Book{
+			Bid: bid, Ask: ask, Ts: time.Now(),
+			Source: f.wsEndpoint, ConnID: connID,
+		})
 	}
 }

@@ -30,6 +30,14 @@ type Sample struct {
 	DexTs  time.Time `json:"dex_ts"`
 	SkewMs int64     `json:"skew_ms"`
 
+	// Provenance: exactly where each leg physically came from. CexSource is
+	// the feed endpoint URL and CexConnID the connection instance that
+	// delivered the top-of-book (CexTs is its receive time); DexSource is
+	// the RPC / quote-API endpoint that answered the DEX quotes.
+	CexSource string `json:"cex_source"`
+	CexConnID string `json:"cex_conn_id"`
+	DexSource string `json:"dex_source"`
+
 	CexBid float64 `json:"cex_bid"`
 	CexAsk float64 `json:"cex_ask"`
 	CexMid float64 `json:"cex_mid"`
@@ -79,9 +87,11 @@ type Sample struct {
 	// TVL gate. PoolTVLUSD is -1 when the venue cannot report TVL.
 	PoolTVLUSD    float64 `json:"pool_tvl_usd"`
 	MinPoolTVLUSD float64 `json:"min_pool_tvl_usd"`
-	// IncludeInStats is false when the sample fails a quality gate (TVL or
-	// leg skew); it is still recorded so those periods remain observable.
-	// ExcludeReason names the gate(s) that failed: "tvl", "skew", "tvl+skew".
+	// IncludeInStats is false when the sample fails a quality gate: TVL,
+	// leg skew, or a configured quote-basis book being unavailable (the
+	// canonical corrected edge cannot be computed then — never silently
+	// substituted). ExcludeReason joins the failed gates: "tvl", "skew",
+	// "basis", e.g. "tvl+skew".
 	IncludeInStats bool   `json:"include_in_stats"`
 	ExcludeReason  string `json:"exclude_reason,omitempty"`
 }

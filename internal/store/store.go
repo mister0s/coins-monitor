@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +33,9 @@ CREATE TABLE IF NOT EXISTS samples (
 	cex_ts INTEGER NOT NULL DEFAULT 0,
 	dex_ts INTEGER NOT NULL DEFAULT 0,
 	skew_ms INTEGER NOT NULL DEFAULT 0,
+	cex_source TEXT NOT NULL DEFAULT '',
+	cex_conn_id TEXT NOT NULL DEFAULT '',
+	dex_source TEXT NOT NULL DEFAULT '',
 	cex_bid REAL NOT NULL DEFAULT 0,
 	cex_ask REAL NOT NULL DEFAULT 0,
 	cex_mid REAL NOT NULL DEFAULT 0,
@@ -64,7 +68,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_samples_identity ON samples(symbol, trade_s
 `
 
 const sampleColumns = `ts, symbol, tier, cex_venue, dex_venue, chain, trade_size_usd,
-	cex_ts, dex_ts, skew_ms, cex_bid, cex_ask, cex_mid, dex_buy_price, dex_sell_price,
+	cex_ts, dex_ts, skew_ms, cex_source, cex_conn_id, dex_source,
+	cex_bid, cex_ask, cex_mid, dex_buy_price, dex_sell_price,
 	gross_buy_dex_sell_cex_bps, net_buy_dex_sell_cex_bps, gross_buy_cex_sell_dex_bps, net_buy_cex_sell_dex_bps,
 	basis_symbol, basis_mid,
 	gross_buy_dex_sell_cex_adj_bps, net_buy_dex_sell_cex_adj_bps, gross_buy_cex_sell_dex_adj_bps, net_buy_cex_sell_dex_adj_bps,
@@ -93,6 +98,18 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	// Migrations for databases created before these columns existed; a
+	// duplicate-column error means the column is already there.
+	for _, ddl := range []string{
+		`ALTER TABLE samples ADD COLUMN cex_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN cex_conn_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE samples ADD COLUMN dex_source TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate schema: %w", err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 
@@ -110,9 +127,10 @@ func (s *Store) Write(smp engine.Sample) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO samples (`+sampleColumns+`) VALUES
-		(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		smp.Ts.UnixNano(), smp.Symbol, smp.Tier, smp.CexVenue, smp.DexVenue, smp.Chain, smp.TradeSizeUSD,
 		smp.CexTs.UnixNano(), smp.DexTs.UnixNano(), smp.SkewMs,
+		smp.CexSource, smp.CexConnID, smp.DexSource,
 		smp.CexBid, smp.CexAsk, smp.CexMid, smp.DexBuyPrice, smp.DexSellPrice,
 		smp.GrossBuyDexSellCexBps, smp.NetBuyDexSellCexBps, smp.GrossBuyCexSellDexBps, smp.NetBuyCexSellDexBps,
 		smp.BasisSymbol, smp.BasisMid,
@@ -129,6 +147,7 @@ func scanSample(rows *sql.Rows) (engine.Sample, error) {
 	var momOK, include int
 	err := rows.Scan(&ts, &smp.Symbol, &smp.Tier, &smp.CexVenue, &smp.DexVenue, &smp.Chain, &smp.TradeSizeUSD,
 		&cexTs, &dexTs, &smp.SkewMs,
+		&smp.CexSource, &smp.CexConnID, &smp.DexSource,
 		&smp.CexBid, &smp.CexAsk, &smp.CexMid, &smp.DexBuyPrice, &smp.DexSellPrice,
 		&smp.GrossBuyDexSellCexBps, &smp.NetBuyDexSellCexBps, &smp.GrossBuyCexSellDexBps, &smp.NetBuyCexSellDexBps,
 		&smp.BasisSymbol, &smp.BasisMid,

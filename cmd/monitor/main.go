@@ -172,6 +172,16 @@ func run(configPath string, log *slog.Logger) error {
 		}
 	}
 
+	// Startup self-test: one LIVE quote per venue, printed with its
+	// timestamp, before any sampling starts. A failing venue is reported
+	// explicitly — the monitor never proceeds quietly past a dead feed.
+	if failures := selfTest(ctx, log, runners); failures > 0 {
+		log.Warn("SELF-TEST: some venues FAILED — their pairs will record nothing until the venue recovers",
+			"failed", failures)
+	} else {
+		log.Info("SELF-TEST: all venues returned live quotes")
+	}
+
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		return fmt.Errorf("open sample store: %w", err)
@@ -232,6 +242,59 @@ func appendUnique(list []string, s string) []string {
 		}
 	}
 	return append(list, s)
+}
+
+// selfTest fetches one live quote per configured venue leg and prints each
+// with its receive timestamp; failures are named explicitly. Returns the
+// number of failed legs.
+func selfTest(ctx context.Context, log *slog.Logger, runners []*engine.PairRunner) int {
+	failures := 0
+	cexSnapshot := func(p config.Pair, symbol string) (cex.Book, error) {
+		sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		switch p.CEX.Venue {
+		case "binance":
+			return cex.SnapshotBinance(sctx, p.CEX.RestEndpoint, symbol)
+		case "kucoin":
+			return cex.SnapshotKucoin(sctx, p.CEX.RestEndpoint, symbol)
+		}
+		return cex.Book{}, fmt.Errorf("unsupported venue %q", p.CEX.Venue)
+	}
+	for _, r := range runners {
+		p := r.Pair
+		if book, err := cexSnapshot(p, p.CEX.Symbol); err != nil {
+			failures++
+			log.Error("SELF-TEST FAILED: CEX leg", "pair", p.Symbol, "venue", p.CEX.Venue,
+				"symbol", p.CEX.Symbol, "err", err)
+		} else {
+			log.Info("self-test: CEX live quote", "pair", p.Symbol, "venue", p.CEX.Venue,
+				"bid", book.Bid, "ask", book.Ask, "ts", book.Ts.UTC().Format(time.RFC3339Nano))
+		}
+		if bs := p.DEX.QuoteBasisSymbol; bs != "" {
+			if book, err := cexSnapshot(p, bs); err != nil {
+				failures++
+				log.Error("SELF-TEST FAILED: quote-basis leg", "pair", p.Symbol, "basis", bs, "err", err)
+			} else {
+				log.Info("self-test: basis live quote", "pair", p.Symbol, "basis", bs,
+					"mid", book.Mid(), "ts", book.Ts.UTC().Format(time.RFC3339Nano))
+			}
+		}
+		qctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		baseOut, err := r.Quoter.QuoteBuyBase(qctx, p.TradeSizesUSD[0])
+		cancel()
+		ts := time.Now()
+		if err != nil || baseOut <= 0 {
+			failures++
+			log.Error("SELF-TEST FAILED: DEX leg", "pair", p.Symbol, "venue", r.Quoter.Venue(),
+				"source", r.Quoter.Source(), "err", err)
+			continue
+		}
+		log.Info("self-test: DEX live quote", "pair", p.Symbol, "venue", r.Quoter.Venue(),
+			"size_usd", p.TradeSizesUSD[0],
+			"effective_price", fmt.Sprintf("%.6f", p.TradeSizesUSD[0]/baseOut),
+			"source", r.Quoter.Source(), "ts", ts.UTC().Format(time.RFC3339Nano))
+	}
+	return failures
 }
 
 // probeFeed returns a symbol-less feed used only for listing validation.

@@ -74,6 +74,8 @@ func NewUniswapV3(client *evm.Client, quoter, pool, baseToken string, baseDecima
 
 func (u *UniswapV3) Venue() string { return "uniswap_v3" }
 
+func (u *UniswapV3) Source() string { return u.client.URL() }
+
 func (u *UniswapV3) QuoteBuyBase(ctx context.Context, quoteIn float64) (float64, error) {
 	out, err := u.quoteExactIn(ctx, evm.ToUnits(quoteIn, u.quoteDecimals), true)
 	if err != nil {

@@ -70,6 +70,8 @@ func NewLFJ(ctx context.Context, client *evm.Client, pair, baseToken string, bas
 
 func (l *LFJ) Venue() string { return "lfj" }
 
+func (l *LFJ) Source() string { return l.client.URL() }
+
 // getSwapOut(amountIn, swapForY) returns (amountInLeft, amountOut, fee).
 // A non-zero amountInLeft means the book cannot absorb the size.
 func (l *LFJ) swapOut(ctx context.Context, amountIn *big.Int, swapForY bool) (*big.Int, error) {

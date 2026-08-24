@@ -256,12 +256,17 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 		// computeEdges treats as identity (adj == raw).
 		basisSym := r.Pair.DEX.QuoteBasisSymbol
 		var basisMid float64
+		basisOK := true
 		if basisSym != "" {
 			if bb, bok := r.Feed.Book(basisSym); bok &&
 				time.Since(bb.Ts) <= r.cfg.MaxBookAge.Std() && bb.Mid() > 0 {
 				basisMid = bb.Mid()
 			} else {
-				r.log.Debug("quote-basis book unavailable; recording raw only", "basis", basisSym)
+				// The canonical corrected edge cannot be computed without
+				// the basis book. Record the raw truth but flag the sample
+				// out of stats — never silently substitute adj == raw.
+				basisOK = false
+				r.log.Warn("quote-basis book unavailable; sample excluded from stats", "basis", basisSym)
 			}
 		}
 		var reasons []string
@@ -270,6 +275,9 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 		}
 		if !skewOK {
 			reasons = append(reasons, "skew")
+		}
+		if !basisOK {
+			reasons = append(reasons, "basis")
 		}
 
 		s := Sample{
@@ -281,6 +289,9 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 			Chain:           r.Pair.DEX.Chain,
 			TradeSizeUSD:    size,
 			CexTs:           book.Ts.UTC(),
+			CexSource:       book.Source,
+			CexConnID:       book.ConnID,
+			DexSource:       r.Quoter.Source(),
 			DexTs:           dexTs.UTC(),
 			SkewMs:          skew.Milliseconds(),
 			CexBid:          book.Bid,
