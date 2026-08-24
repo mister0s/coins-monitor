@@ -35,14 +35,15 @@ type WindowStats struct {
 	TotalPosS float64 // total net-positive seconds (upper bound)
 }
 
-// FindWindows groups consecutive net-positive samples (raw edge) into windows.
+// FindWindows groups consecutive net-positive samples of the CANONICAL
+// (basis-corrected) edge into windows.
 func FindWindows(a *Agg) WindowStats {
 	return findWindows(a.Key, a.Ts, a.Net)
 }
 
-// FindWindowsAdj is FindWindows over the quote-basis-corrected edge.
-func FindWindowsAdj(a *Agg) WindowStats {
-	return findWindows(a.Key, a.Ts, a.NetAdj)
+// FindWindowsRaw is FindWindows over the uncorrected debug edge.
+func FindWindowsRaw(a *Agg) WindowStats {
+	return findWindows(a.Key, a.Ts, a.NetRaw)
 }
 
 // findWindows groups consecutive net-positive samples into windows.
@@ -139,7 +140,7 @@ func findWindows(key Key, tss []time.Time, nets []float64) WindowStats {
 // ReportWindows renders the profitable-window section of the report.
 func ReportWindows(w io.Writer, aggs map[Key]*Agg) {
 	keys := sortedKeys(aggs)
-	fmt.Fprintln(w, "\n== profitable windows (consecutive samples with net edge > 0) ==")
+	fmt.Fprintln(w, "\n== profitable windows (consecutive samples with basis-corrected net edge > 0) ==")
 	fmt.Fprintf(w, "%-10s %-9s %-18s %8s %7s | %7s %7s %7s | %8s %8s\n",
 		"pair", "size_usd", "direction", "windows", "res_s",
 		"d_p50s", "d_p95s", "d_maxs",
@@ -176,27 +177,4 @@ bridged across data gaps (> 3x median spacing). ew_dur_s weights each window's
 duration by its mean net edge — sustained fat windows dominate, long marginal
 ones do not: sum(dur x mean_net) / sum(mean_net). pos_s/day = net-positive
 seconds per day of observed span (upper bound).`)
-}
-
-// sortedKeys orders group keys tier -> symbol -> size -> direction.
-func sortedKeys(aggs map[Key]*Agg) []Key {
-	keys := make([]Key, 0, len(aggs))
-	for k := range aggs {
-		keys = append(keys, k)
-	}
-	tierRank := map[string]int{"large": 0, "mid": 1, "small": 2}
-	sort.Slice(keys, func(i, j int) bool {
-		a, b := keys[i], keys[j]
-		if tierRank[a.Tier] != tierRank[b.Tier] {
-			return tierRank[a.Tier] < tierRank[b.Tier]
-		}
-		if a.Symbol != b.Symbol {
-			return a.Symbol < b.Symbol
-		}
-		if a.SizeUSD != b.SizeUSD {
-			return a.SizeUSD < b.SizeUSD
-		}
-		return a.Direction < b.Direction
-	})
-	return keys
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/mister0s/coins-monitor/internal/engine"
 	"github.com/mister0s/coins-monitor/internal/evm"
 	"github.com/mister0s/coins-monitor/internal/ratelimit"
+	"github.com/mister0s/coins-monitor/internal/store"
 )
 
 func main() {
@@ -171,11 +172,12 @@ func run(configPath string, log *slog.Logger) error {
 		}
 	}
 
-	w, err := engine.NewJSONLWriter(cfg.DataDir)
+	st, err := store.Open(cfg.DBPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("open sample store: %w", err)
 	}
-	defer w.Close()
+	defer st.Close()
+	go retentionLoop(ctx, st, cfg, log)
 
 	for _, f := range feeds {
 		f.Start(ctx)
@@ -183,7 +185,7 @@ func run(configPath string, log *slog.Logger) error {
 	log.Info("monitor started",
 		"pairs", len(runners),
 		"poll_interval", cfg.PollInterval.Std(),
-		"data_dir", cfg.DataDir,
+		"db", cfg.DBPath,
 	)
 	for _, r := range runners {
 		log.Info("monitoring",
@@ -192,9 +194,35 @@ func run(configPath string, log *slog.Logger) error {
 			"sizes_usd", r.Pair.TradeSizesUSD)
 	}
 
-	engine.New(cfg, log, w, runners).Run(ctx)
+	engine.New(cfg, log, st, runners).Run(ctx)
 	log.Info("monitor stopped")
 	return nil
+}
+
+// retentionLoop archives samples older than the retention window to
+// compressed JSONL and vacuums, on start and then daily.
+func retentionLoop(ctx context.Context, st *store.Store, cfg *config.Config, log *slog.Logger) {
+	run := func() {
+		cutoff := time.Now().Add(-cfg.Retention.Std())
+		n, path, err := st.Retain(cutoff, cfg.ArchiveDir)
+		switch {
+		case err != nil:
+			log.Error("retention failed", "err", err)
+		case n > 0:
+			log.Info("retention: archived old samples", "rows", n, "archive", path)
+		}
+	}
+	run()
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			run()
+		}
+	}
 }
 
 func appendUnique(list []string, s string) []string {
@@ -238,6 +266,15 @@ func buildQuoter(ctx context.Context, p config.Pair, clientFor func(string) (*ev
 	}
 
 	switch d.Venue {
+	case "uniswap_v2":
+		route := make([]string, 0, len(d.Route))
+		for _, h := range d.Route {
+			route = append(route, h.Token)
+		}
+		ictx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return dex.NewUniswapV2(ictx, client, d.RouterAddress, d.PoolAddress,
+			d.BaseToken.Address, baseDec, d.QuoteToken.Address, quoteDec, route)
 	case "uniswap_v3":
 		route := make([]dex.PathHop, 0, len(d.Route))
 		for _, h := range d.Route {

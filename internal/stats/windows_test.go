@@ -12,7 +12,7 @@ func series(nets []float64) *Agg {
 	base := time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC)
 	a := &Agg{Key: Key{Tier: "large", Symbol: "T/U", SizeUSD: 1000, Direction: "buy_dex_sell_cex"}}
 	for i, n := range nets {
-		a.add(base.Add(time.Duration(i)*2*time.Second), n, n, n, math.NaN())
+		a.add(base.Add(time.Duration(i)*2*time.Second), n, n, n, math.NaN(), "")
 	}
 	return a
 }
@@ -78,7 +78,7 @@ func TestFindWindowsBreaksOnDataGap(t *testing.T) {
 	base := time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC)
 	a := &Agg{Key: Key{Symbol: "T/U"}}
 	for _, off := range []time.Duration{0, 2 * time.Second, 62 * time.Second, 64 * time.Second} {
-		a.add(base.Add(off), 5, 5, 5, math.NaN())
+		a.add(base.Add(off), 5, 5, 5, math.NaN(), "")
 	}
 	ws := FindWindows(a)
 	if ws.Count != 2 {

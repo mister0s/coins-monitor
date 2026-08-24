@@ -64,6 +64,12 @@ type Sample struct {
 	// startup).
 	CexMidChg10sBps float64 `json:"cex_mid_chg_10s_bps"`
 	MomentumOK      bool    `json:"momentum_ok"`
+	// MomentumBucket classifies CexMidChg10sBps against the pair's
+	// configured threshold at sample time: "down", "flat", "up" — empty
+	// when MomentumOK is false. The threshold used is stored alongside so
+	// later re-bucketing is possible.
+	MomentumBucket       string  `json:"momentum_bucket,omitempty"`
+	MomentumThresholdBps float64 `json:"momentum_threshold_bps,omitempty"`
 
 	// Cost inputs used for the net figures.
 	CexFeeBps float64 `json:"cex_fee_bps"`

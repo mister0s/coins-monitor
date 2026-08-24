@@ -30,8 +30,11 @@ pair and each configured trade size:
    Net edge = gross − `cex_taker_fee_bps` − `gas_usd/size × 10⁴` −
    `extra_buffer_bps`. The model assumes inventory pre-positioned on both
    venues (the standard arb setup); bridge/withdrawal rebalancing costs are
-   out of scope. Quote tokens (USDT/USDC) are treated as $1.
-4. **Record** — append every observation to `data/<PAIR>.jsonl`. Each sample
+   out of scope. When the DEX quote token differs from the CEX quote token
+   (USDC vs USDT), the pair's `quote_basis_symbol` book converts between
+   them per sample — see Diagnostics below.
+4. **Record** — write every observation to SQLite (`data/monitor.db`;
+   `cmd/import-jsonl` backfills legacy `data/*.jsonl` files). Each sample
    carries independent leg timestamps (`cex_ts` = when the top-of-book was
    received, `dex_ts` = when both DEX quotes completed) plus their skew;
    samples are flagged `include_in_stats: false` (with an `exclude_reason`)
@@ -78,6 +81,7 @@ the skew gate then excludes) rather than into RPC bans.
 | CEX | Binance | `bookTicker` WebSocket (combined stream, auto-reconnect) |
 | CEX | KuCoin | level-1 orderbook REST polling |
 | DEX | Uniswap v3 (Ethereum, Polygon, …) | QuoterV2 `quoteExactInputSingle` / multi-hop `quoteExactInput` via `eth_call` |
+| DEX | Uniswap v2 (Ethereum) | router `getAmountsOut` via `eth_call`; the pair address is factory-derived (or verified against the factory — a pasted fake/honeypot pool fails startup) |
 | DEX | LFJ / Trader Joe Liquidity Book (Avalanche) | LBPair `getSwapOut` via `eth_call` (walks the bins → real depth) |
 | DEX | Velodrome v2 (Optimism) | pool `getAmountOut` via `eth_call` (vAMM/sAMM pools; Slipstream CL not supported) |
 | DEX | Jupiter (Solana) | HTTP quote API — aggregate across Raydium, Orca, etc. |
@@ -94,14 +98,27 @@ Requires Go 1.27+ (the `go` directive tracks the latest stable release; with
 right toolchain automatically).
 
 ```sh
-# 1. Review config.yaml: fill in the REPLACE_ME pool addresses (see comments)
-#    and ideally point `chains:` at your own RPC provider.
+# 1. Review config.yaml — ideally point `chains:` at your own RPC provider
+#    (see the request-budget table above for sizing).
 # 2. Run the monitor:
 go run ./cmd/monitor -config config.yaml
 
-# ... let it collect for hours/days, then summarize:
-go run ./cmd/report -data data
+# ... let it collect for hours/days, then summarize (reads data/monitor.db):
+go run ./cmd/report
+
+# one-time: backfill any pre-SQLite .jsonl files
+go run ./cmd/import-jsonl -data data -db data/monitor.db
 ```
+
+Samples land in SQLite (`db_path`, default `data/monitor.db`). On start and
+daily, rows older than `retention` (default 30d) are archived to compressed
+JSONL under `archive_dir` and vacuumed away.
+
+**The canonical metric everywhere is the basis-corrected net edge** (DEX leg
+re-expressed in CEX quote units via the pair's `quote_basis_symbol` book).
+The uncorrected edge is retained in every sample and report as a debug
+column (`raw_p50`, the `raw:` columns of the survival table) — it is what a
+naive USDC==USDT comparison would show.
 
 The report shows, per pair × trade size × direction: sample count, gross and
 net spread percentiles (p50/p95/max, in bps), and **`n>0` — the share of
@@ -130,7 +147,8 @@ historical data stays comparable):
    were measuring the stablecoin basis.
 2. **Momentum correlation** — each sample records the CEX mid's change over
    the prior ~10s. The report buckets corrected net edge by momentum
-   (down/flat/up, threshold `-momentum-threshold`, default 10 bps). Positive
+   (down/flat/up, per-pair `momentum_threshold_bps` stored on each sample;
+   `-momentum-threshold` only re-buckets legacy rows). Positive
    edge concentrated in the **up** bucket means the DEX quote lags a rising
    CEX price — latency skew, not capturable opportunity.
 3. **Persistence profile** — hourly medians of raw vs corrected net edge
@@ -157,12 +175,14 @@ appending one YAML block. Notes on the shipped pairs:
 - **SOL/USDT (Jupiter)** — works out of the box via the free
   `lite-api.jup.ag` endpoint; there is no single pool, so no TVL gate.
 - **POL/USDT (Uniswap v3)** — WPOL/USDT 0.05% pool on Polygon (~$1M).
-- **ACX/USDT, GLM/USDT, FLUX/USDT (Uniswap v3)** — routed USDT→WETH→token;
-  the deepest pools are all the 1% fee tier vs WETH. ACX is reasonably deep
-  (~$1M); GLM and FLUX v3 pools are very thin (~$55k each — most GLM DEX
-  liquidity is in Uniswap v2, which isn't a supported venue), so expect the
-  TVL gate to exclude their samples. For routed pairs the TVL estimate
-  counts only the base-token side of the final pool (~2x understated).
+- **ACX/USDT (Uniswap v3)** — routed USDT→WETH→ACX via the 1% ACX/WETH
+  pool (~$1M).
+- **GLM/USDT, FLUX/USDT (Uniswap v2)** — their liquidity lives in v2
+  WETH pairs, so both route USDT→WETH→token through the v2 router. Pair
+  addresses are derived from the v2 factory at startup and any configured
+  address is verified against it (fake/honeypot pool guard). For all routed
+  pairs the TVL estimate prices only the base-token side of the final pool
+  (~2x understated).
 - **VELO/USDT** — ships disabled deliberately: the "VELO" listed on
   Binance/KuCoin is **Velo Labs**, a different asset from Velodrome
   Finance's VELO on Optimism. Enabling it as-is would compare two unrelated
@@ -178,14 +198,18 @@ treat `n>0` rates as an upper bound on capturable frequency.
 ## Layout
 
 ```
-cmd/monitor      long-running sampler
-cmd/report       offline summary of recorded samples
-internal/config  YAML config, env expansion, validation
-internal/cex     Binance WS + KuCoin REST top-of-book feeds
-internal/dex     size-aware quoters (Uniswap v3, LFJ, Velodrome, Jupiter)
-internal/evm     minimal read-only JSON-RPC + ABI encoding (eth_call only)
-internal/engine  sampling loop, break-even math, JSONL recorder
-internal/stats   aggregation and report rendering
+cmd/monitor        long-running sampler (records to SQLite)
+cmd/report         summary + diagnostics from the SQLite store
+cmd/spotcheck      dump raw legs + Binance 1s klines around one timestamp
+cmd/import-jsonl   backfill legacy JSONL sample files into SQLite
+internal/config    YAML config, env expansion, validation
+internal/cex       Binance WS + KuCoin REST top-of-book feeds
+internal/dex       size-aware quoters (Uniswap v2/v3, LFJ, Velodrome, Jupiter)
+internal/evm       minimal read-only JSON-RPC + ABI encoding (eth_call only)
+internal/engine    sampling loop, break-even math, quality gates
+internal/stats     aggregation, windows, diagnostics, report rendering
+internal/store     SQLite persistence, retention/archival
+internal/ratelimit shared per-endpoint request pacing
 ```
 
 ## License

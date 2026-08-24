@@ -9,12 +9,12 @@ import (
 	"time"
 )
 
-// ReportWindowsAdjusted re-runs the window analysis on the quote-basis
-// corrected edge and reports how much of the raw edge survives, per series.
-// surv% compares total net-positive seconds corrected vs raw.
+// ReportWindowsAdjusted contrasts the window analysis on the uncorrected
+// (raw/debug) edge with the canonical corrected one and reports how much of
+// the raw edge survives. surv% compares total net-positive seconds.
 func ReportWindowsAdjusted(w io.Writer, aggs map[Key]*Agg) {
 	keys := sortedKeys(aggs)
-	fmt.Fprintln(w, "\n== quote-basis corrected windows (DEX leg re-expressed in CEX quote units) ==")
+	fmt.Fprintln(w, "\n== basis-correction survival (raw/debug edge vs canonical corrected edge) ==")
 	fmt.Fprintf(w, "%-10s %-9s %-18s | %-24s | %-24s | %6s\n",
 		"", "", "", "raw: win  p95s  pos_s/d", "adj: win  p95s  pos_s/d", "surv%")
 	fmt.Fprintf(w, "%-10s %-9s %-18s |\n", "pair", "size_usd", "direction")
@@ -26,8 +26,8 @@ func ReportWindowsAdjusted(w io.Writer, aggs map[Key]*Agg) {
 			currentTier = k.Tier
 			fmt.Fprintf(w, "== tier: %s ==\n", currentTier)
 		}
-		raw := FindWindows(a)
-		adj := FindWindowsAdj(a)
+		raw := FindWindowsRaw(a)
+		adj := FindWindows(a)
 		span := 0.0
 		if len(a.Ts) > 1 {
 			tss := append([]time.Time(nil), a.Ts...)
@@ -57,13 +57,16 @@ was the stablecoin basis (e.g. USDC/USDT deviating from 1), not an arbitrage.
 Series without a configured quote_basis_symbol have adj == raw by construction.`)
 }
 
-// ReportMomentum buckets samples by the CEX mid's move over the prior ~10s
-// and reports the mean net edge per bucket. Positive edge concentrated in
-// the strong-up bucket for buy_dex_sell_cex (the DEX quote lagging a rising
-// CEX price) indicates latency skew rather than genuine opportunity.
-func ReportMomentum(w io.Writer, aggs map[Key]*Agg, thresholdBps float64) {
+// ReportMomentum is the standing latency-skew check: it buckets samples by
+// the CEX mid's move over the prior ~10s and reports the mean canonical net
+// edge per bucket. Positive edge concentrated in the strong-up bucket for
+// buy_dex_sell_cex (the DEX quote lagging a rising CEX price) indicates
+// latency skew rather than genuine opportunity. Buckets come from the
+// per-pair threshold stored on each sample; fallbackThresholdBps only
+// re-buckets legacy rows recorded before buckets were stored.
+func ReportMomentum(w io.Writer, aggs map[Key]*Agg, fallbackThresholdBps float64) {
 	keys := sortedKeys(aggs)
-	fmt.Fprintf(w, "\n== momentum correlation (CEX mid change over prior 10s; threshold %.0f bps) ==\n", thresholdBps)
+	fmt.Fprintf(w, "\n== latency-skew check: net edge by prior-10s CEX momentum (stored per-pair buckets; legacy fallback %.0f bps) ==\n", fallbackThresholdBps)
 	fmt.Fprintf(w, "%-10s %-9s %-18s | %-22s | %-22s | %-22s | %6s\n",
 		"pair", "size_usd", "direction",
 		"down:  n  mean  pos%", "flat:  n  mean  pos%", "up:    n  mean  pos%", "no-mom")
@@ -86,15 +89,27 @@ func ReportMomentum(w io.Writer, aggs map[Key]*Agg, thresholdBps float64) {
 				noMom++
 				continue
 			}
+			name := a.Bucket[i]
+			if name == "" { // legacy row: re-bucket with the fallback threshold
+				switch {
+				case m < -fallbackThresholdBps:
+					name = "down"
+				case m > fallbackThresholdBps:
+					name = "up"
+				default:
+					name = "flat"
+				}
+			}
 			b := &flat
-			if m < -thresholdBps {
+			switch name {
+			case "down":
 				b = &down
-			} else if m > thresholdBps {
+			case "up":
 				b = &up
 			}
 			b.n++
-			b.sum += a.NetAdj[i]
-			if a.NetAdj[i] > 0 {
+			b.sum += a.Net[i]
+			if a.Net[i] > 0 {
 				b.pos++
 			}
 		}
@@ -142,8 +157,8 @@ func ReportHourly(w io.Writer, aggs map[Key]*Agg) {
 				ha = &hourAgg{}
 				hours[h] = ha
 			}
-			ha.raw = append(ha.raw, a.Net[i])
-			ha.adj = append(ha.adj, a.NetAdj[i])
+			ha.raw = append(ha.raw, a.NetRaw[i])
+			ha.adj = append(ha.adj, a.Net[i])
 		}
 		ordered := make([]time.Time, 0, len(hours))
 		for h := range hours {

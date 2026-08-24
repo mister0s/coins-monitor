@@ -1,12 +1,10 @@
 package engine
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"log/slog"
 	"os"
-	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,32 +61,22 @@ func testConfig(t *testing.T) *config.Config {
 	}
 }
 
-func readSamples(t *testing.T, dir, name string) []Sample {
-	t.Helper()
-	f, err := os.Open(filepath.Join(dir, name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	var out []Sample
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		var s Sample
-		if err := json.Unmarshal(sc.Bytes(), &s); err != nil {
-			t.Fatal(err)
-		}
-		out = append(out, s)
-	}
-	return out
+// fakeRecorder captures written samples in memory.
+type fakeRecorder struct {
+	mu      sync.Mutex
+	samples []Sample
+}
+
+func (f *fakeRecorder) Write(s Sample) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.samples = append(f.samples, s)
+	return nil
 }
 
 func TestSampleOnceEndToEnd(t *testing.T) {
 	cfg := testConfig(t)
-	w, err := NewJSONLWriter(cfg.DataDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer w.Close()
+	w := &fakeRecorder{}
 
 	// DEX trades 1% below CEX: buying on DEX and selling on CEX should be
 	// clearly profitable net of 10+5 bps fees + $1 gas.
@@ -108,7 +96,7 @@ func TestSampleOnceEndToEnd(t *testing.T) {
 
 	r.sampleOnce(context.Background())
 
-	samples := readSamples(t, cfg.DataDir, "TST-USDT.jsonl")
+	samples := w.samples
 	if len(samples) != 2 {
 		t.Fatalf("samples = %d, want 2 (one per trade size)", len(samples))
 	}
@@ -138,8 +126,7 @@ func TestSampleOnceEndToEnd(t *testing.T) {
 
 func TestTVLGateExcludes(t *testing.T) {
 	cfg := testConfig(t)
-	w, _ := NewJSONLWriter(cfg.DataDir)
-	defer w.Close()
+	w := &fakeRecorder{}
 	pair := config.Pair{
 		Symbol: "THN/USDT", Tier: "small",
 		CEX:           config.CexConfig{Venue: "binance", Symbol: "THNUSDT"},
@@ -155,7 +142,7 @@ func TestTVLGateExcludes(t *testing.T) {
 	New(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), w, []*PairRunner{r})
 	r.sampleOnce(context.Background())
 
-	samples := readSamples(t, cfg.DataDir, "THN-USDT.jsonl")
+	samples := w.samples
 	if len(samples) != 1 {
 		t.Fatalf("samples = %d, want 1", len(samples))
 	}
@@ -170,8 +157,7 @@ func TestTVLGateExcludes(t *testing.T) {
 func TestSkewGateExcludes(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.MaxLegSkew = config.Duration(3 * time.Second)
-	w, _ := NewJSONLWriter(cfg.DataDir)
-	defer w.Close()
+	w := &fakeRecorder{}
 	pair := config.Pair{
 		Symbol: "SKW/USDT", Tier: "large",
 		CEX:           config.CexConfig{Venue: "binance", Symbol: "SKWUSDT"},
@@ -188,7 +174,7 @@ func TestSkewGateExcludes(t *testing.T) {
 	New(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), w, []*PairRunner{r})
 	r.sampleOnce(context.Background())
 
-	samples := readSamples(t, cfg.DataDir, "SKW-USDT.jsonl")
+	samples := w.samples
 	if len(samples) != 1 {
 		t.Fatalf("samples = %d, want 1 (recorded despite skew)", len(samples))
 	}
@@ -209,8 +195,7 @@ func TestSkewGateExcludes(t *testing.T) {
 
 func TestQuoteBasisCorrection(t *testing.T) {
 	cfg := testConfig(t)
-	w, _ := NewJSONLWriter(cfg.DataDir)
-	defer w.Close()
+	w := &fakeRecorder{}
 	// DEX quoted in USDC while CEX is USDT, USDC trading at 1.0005 USDT:
 	// the raw buy-DEX edge overstates reality; the corrected edge must be
 	// ~5 bps smaller.
@@ -236,7 +221,7 @@ func TestQuoteBasisCorrection(t *testing.T) {
 	New(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), w, []*PairRunner{r})
 	r.sampleOnce(context.Background())
 
-	samples := readSamples(t, cfg.DataDir, "BAS-USDT.jsonl")
+	samples := w.samples
 	if len(samples) != 1 {
 		t.Fatalf("samples = %d, want 1", len(samples))
 	}
@@ -292,8 +277,7 @@ func TestMomentum10s(t *testing.T) {
 
 func TestStaleBookSkipsSample(t *testing.T) {
 	cfg := testConfig(t)
-	w, _ := NewJSONLWriter(cfg.DataDir)
-	defer w.Close()
+	w := &fakeRecorder{}
 	pair := config.Pair{
 		Symbol: "OLD/USDT", Tier: "large",
 		CEX:           config.CexConfig{Venue: "binance", Symbol: "OLDUSDT"},
@@ -307,7 +291,7 @@ func TestStaleBookSkipsSample(t *testing.T) {
 	}
 	New(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), w, []*PairRunner{r})
 	r.sampleOnce(context.Background())
-	if _, err := os.Stat(filepath.Join(cfg.DataDir, "OLD-USDT.jsonl")); !os.IsNotExist(err) {
+	if len(w.samples) != 0 {
 		t.Error("stale book must not produce samples")
 	}
 }

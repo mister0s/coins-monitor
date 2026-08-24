@@ -9,18 +9,25 @@ import (
 	"os"
 
 	"github.com/mister0s/coins-monitor/internal/stats"
+	"github.com/mister0s/coins-monitor/internal/store"
 )
 
 func main() {
-	dataDir := flag.String("data", "data", "directory of recorded .jsonl sample files")
+	dbPath := flag.String("db", "data/monitor.db", "SQLite sample database (see cmd/import-jsonl for legacy files)")
 	includeExcluded := flag.Bool("include-excluded", false,
 		"include samples that failed the min_pool_tvl_usd or leg-skew gate")
 	momentumThreshold := flag.Float64("momentum-threshold", 10,
-		"bps of 10s CEX mid change separating flat from strong up/down buckets")
+		"fallback bucket threshold (bps) for legacy rows without a stored momentum bucket")
 	hourly := flag.Bool("hourly", true, "print the hourly median net edge time series")
 	flag.Parse()
 
-	aggs, err := stats.LoadDir(*dataDir, *includeExcluded)
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+	aggs, err := stats.LoadStore(st, *includeExcluded)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

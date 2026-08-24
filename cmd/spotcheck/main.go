@@ -8,26 +8,25 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"encoding/json"
+
 	"github.com/mister0s/coins-monitor/internal/config"
 	"github.com/mister0s/coins-monitor/internal/engine"
+	"github.com/mister0s/coins-monitor/internal/store"
 )
 
 func main() {
-	dataDir := flag.String("data", "data", "directory of recorded .jsonl sample files")
+	dbPath := flag.String("db", "data/monitor.db", "SQLite sample database")
 	configPath := flag.String("config", "config.yaml", "config file (resolves CEX symbol/endpoint)")
 	pair := flag.String("pair", "", "pair symbol, e.g. AVAX/USDT (required)")
 	at := flag.String("at", "", "window timestamp, RFC3339, e.g. 2026-08-24T12:34:56Z (required)")
@@ -45,7 +44,13 @@ func main() {
 	}
 	from, to := center.Add(-*window), center.Add(*window)
 
-	samples, err := loadRange(*dataDir, *pair, from, to)
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	samples, err := st.SamplesBetween(*pair, from, to)
+	st.Close()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -60,32 +65,9 @@ func main() {
 	}
 }
 
-func loadRange(dataDir, pair string, from, to time.Time) ([]engine.Sample, error) {
-	path := filepath.Join(dataDir, strings.ReplaceAll(pair, "/", "-")+".jsonl")
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	var out []engine.Sample
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
-	for sc.Scan() {
-		var s engine.Sample
-		if err := json.Unmarshal(sc.Bytes(), &s); err != nil || s.Symbol == "" {
-			continue
-		}
-		if !s.Ts.Before(from) && !s.Ts.After(to) {
-			out = append(out, s)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Ts.Before(out[j].Ts) })
-	return out, sc.Err()
-}
-
 func printSamples(samples []engine.Sample, center time.Time) {
 	if len(samples) == 0 {
-		fmt.Println("no samples in range — check -pair / -at / -data")
+		fmt.Println("no samples in range — check -pair / -at / -db")
 		return
 	}
 	fmt.Printf("== samples (%d) — > marks rows nearest -at ==\n", len(samples))

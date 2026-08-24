@@ -17,6 +17,11 @@ import (
 	"github.com/mister0s/coins-monitor/internal/dex"
 )
 
+// Recorder persists samples; the SQLite store implements it in production.
+type Recorder interface {
+	Write(Sample) error
+}
+
 // PairRunner samples one configured pair.
 type PairRunner struct {
 	Pair   config.Pair
@@ -25,7 +30,7 @@ type PairRunner struct {
 
 	cfg     *config.Config
 	log     *slog.Logger
-	w       *JSONLWriter
+	w       Recorder
 	stagger time.Duration // initial offset so pairs on one endpoint interleave
 
 	mu          sync.Mutex
@@ -95,11 +100,11 @@ func (r *PairRunner) momentum10s(now time.Time, mid float64) (float64, bool) {
 type Engine struct {
 	cfg     *config.Config
 	log     *slog.Logger
-	w       *JSONLWriter
+	w       Recorder
 	runners []*PairRunner
 }
 
-func New(cfg *config.Config, log *slog.Logger, w *JSONLWriter, runners []*PairRunner) *Engine {
+func New(cfg *config.Config, log *slog.Logger, w Recorder, runners []*PairRunner) *Engine {
 	// Spread the start of pairs that share a chain endpoint across the
 	// sampling interval, so their bursts interleave instead of colliding.
 	// The shared per-chain rate limiter is the hard cap; this just smooths.
@@ -201,6 +206,11 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 	}
 	r.recordMid(book.Ts, book.Mid())
 	momentumBps, momentumOK := r.momentum10s(book.Ts, book.Mid())
+	momThreshold := r.Pair.EffectiveMomentumThreshold(r.cfg.MomentumThresholdBps)
+	momBucket := ""
+	if momentumOK {
+		momBucket = BucketMomentum(momentumBps, momThreshold)
+	}
 	r.refreshTVL(ctx, book.Mid())
 	r.mu.Lock()
 	tvl := r.tvlUSD
@@ -263,24 +273,24 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 		}
 
 		s := Sample{
-			Ts:             dexTs.UTC(),
-			Symbol:         r.Pair.Symbol,
-			Tier:           r.Pair.Tier,
-			CexVenue:       r.Feed.Venue(),
-			DexVenue:       r.Quoter.Venue(),
-			Chain:          r.Pair.DEX.Chain,
-			TradeSizeUSD:   size,
-			CexTs:          book.Ts.UTC(),
-			DexTs:          dexTs.UTC(),
-			SkewMs:         skew.Milliseconds(),
-			CexBid:         book.Bid,
-			CexAsk:         book.Ask,
-			CexMid:         mid,
-			DexBuyPrice:    size / baseOut,
-			DexSellPrice:   quoteOut / (size / mid),
-			CexFeeBps:      r.cfg.Costs.CexTakerFeeBps,
-			GasUSD:         gasUSD,
-			BufferBps:      r.cfg.Costs.ExtraBufferBps,
+			Ts:              dexTs.UTC(),
+			Symbol:          r.Pair.Symbol,
+			Tier:            r.Pair.Tier,
+			CexVenue:        r.Feed.Venue(),
+			DexVenue:        r.Quoter.Venue(),
+			Chain:           r.Pair.DEX.Chain,
+			TradeSizeUSD:    size,
+			CexTs:           book.Ts.UTC(),
+			DexTs:           dexTs.UTC(),
+			SkewMs:          skew.Milliseconds(),
+			CexBid:          book.Bid,
+			CexAsk:          book.Ask,
+			CexMid:          mid,
+			DexBuyPrice:     size / baseOut,
+			DexSellPrice:    quoteOut / (size / mid),
+			CexFeeBps:       r.cfg.Costs.CexTakerFeeBps,
+			GasUSD:          gasUSD,
+			BufferBps:       r.cfg.Costs.ExtraBufferBps,
 			PoolTVLUSD:      tvl,
 			MinPoolTVLUSD:   r.Pair.MinPoolTVLUSD,
 			IncludeInStats:  len(reasons) == 0,
@@ -289,6 +299,10 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 			BasisMid:        basisMid,
 			CexMidChg10sBps: momentumBps,
 			MomentumOK:      momentumOK,
+			MomentumBucket:  momBucket,
+		}
+		if momentumOK {
+			s.MomentumThresholdBps = momThreshold
 		}
 		s.computeEdges()
 		if err := r.w.Write(s); err != nil {
@@ -316,6 +330,18 @@ func (r *PairRunner) sampleOnce(ctx context.Context) {
 		r.lastBestNet = bestNet
 		r.lastSample = time.Now()
 		r.mu.Unlock()
+	}
+}
+
+// BucketMomentum classifies a 10s mid change against a threshold.
+func BucketMomentum(chgBps, thresholdBps float64) string {
+	switch {
+	case chgBps < -thresholdBps:
+		return "down"
+	case chgBps > thresholdBps:
+		return "up"
+	default:
+		return "flat"
 	}
 }
 
